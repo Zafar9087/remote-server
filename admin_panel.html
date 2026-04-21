@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Remote Control — Admin</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --border: #30363d;
+  --border-light: #444c56;
+  --text-primary: #c9d1d9;
+  --text-secondary: #8b949e;
+  --accent: #79c0ff;
+  --accent-alt: #58a6ff;
+  --success: #3fb950;
+  --danger: #f85149;
+  --warning: #d29922;
+  --info: #79c0ff;
+}
+
+html, body { 
+  width: 100%; 
+  height: 100%; 
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+/* PERMISSION MODAL */
+.permission-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(4px);
+}
+
+.permission-modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 40px;
+  max-width: 450px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
+  animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUp {
+  from { transform: translateY(20px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.permission-icon {
+  font-size: 3rem;
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.permission-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 12px;
+  text-align: center;
+}
+
+.permission-subtitle {
+  color: var(--text-secondary);
+  text-align: center;
+  margin-bottom: 24px;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.permission-list {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 24px;
+  font-size: 0.9rem;
+}
+
+.permission-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  color: var(--text-secondary);
+}
+
+.permission-item:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+
+.permission-item-icon {
+  color: var(--success);
+  font-weight: bold;
+}
+
+.permission-buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.btn-permission {
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.2s;
+  font-size: 0.95rem;
+}
+
+.btn-allow {
+  background: var(--success);
+  color: #fff;
+  border-color: var(--success);
+}
+
+.btn-allow:hover {
+  background: #2ea043;
+  box-shadow: 0 0 20px rgba(63, 185, 80, 0.3);
+}
+
+.btn-deny {
+  background: var(--bg-primary);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.btn-deny:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* PASSWORD MODAL */
+.password-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.95);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 9998;
+  backdrop-filter: blur(5px);
+}
+
+.password-overlay.active {
+  display: flex;
+}
+
+.password-modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  border-radius: 12px;
+  padding: 40px;
+  max-width: 400px;
+  box-shadow: 0 25px 70px rgba(0, 0, 0, 0.9);
+  animation: slideDown 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-30px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+.password-icon {
+  font-size: 2.5rem;
+  text-align: center;
+  margin-bottom: 16px;
+}
+
+.password-title {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.password-subtitle {
+  color: var(--text-secondary);
+  text-align: center;
+  margin-bottom: 24px;
+  font-size: 0.9rem;
+}
+
+.password-input {
+  width: 100%;
+  padding: 12px 14px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 1rem;
+  margin-bottom: 16px;
+  transition: border-color 0.2s;
+}
+
+.password-input:focus {
+  outline: none;
+  border-color: var(--accent-alt);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+}
+
+.password-input.error {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px rgba(248, 81, 73, 0.1);
+}
+
+.error-message {
+  color: var(--danger);
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+  display: none;
+  text-align: center;
+}
+
+.error-message.show {
+  display: block;
+}
+
+.btn-unlock {
+  width: 100%;
+  padding: 12px;
+  background: var(--accent-alt);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+  transition: all 0.2s;
+}
+
+.btn-unlock:hover {
+  background: #65b1ff;
+  box-shadow: 0 0 20px rgba(88, 166, 255, 0.3);
+}
+
+.btn-unlock:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* BLOCKED STATE */
+.blocked-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bg-primary);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+
+.blocked-screen.show {
+  display: flex;
+}
+
+.blocked-content {
+  text-align: center;
+}
+
+.blocked-icon {
+  font-size: 4rem;
+  margin-bottom: 20px;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+
+.blocked-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--danger);
+}
+
+.blocked-text {
+  color: var(--text-secondary);
+  font-size: 1rem;
+  margin-bottom: 20px;
+  line-height: 1.6;
+}
+
+/* MAIN UI */
+.layout {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  width: 280px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.logo-section {
+  padding: 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-icon {
+  font-size: 1.8rem;
+}
+
+.logo-text {
+  font-weight: 700;
+  font-size: 1rem;
+}
+
+.logo-sub {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  display: block;
+}
+
+.nav-section {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-label {
+  padding: 8px 16px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.nav-item {
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+  border-left: 3px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
+
+.nav-item:hover {
+  background: var(--bg-tertiary);
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.nav-item.active {
+  background: var(--accent)15;
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.script-item {
+  padding: 10px 16px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: all 0.2s;
+  font-size: 0.9rem;
+}
+
+.script-item:hover {
+  background: var(--bg-tertiary);
+  border-left-color: var(--accent);
+}
+
+.script-item.active {
+  background: var(--accent)15;
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.script-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.script-status.online {
+  background: var(--success);
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+}
+
+.header {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-title {
+  font-size: 1.2rem;
+  font-weight: 600;
+}
+
+.header-stats {
+  display: flex;
+  gap: 20px;
+  font-size: 0.85rem;
+}
+
+.stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.stat-value {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.content-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+}
+
+.card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+
+.card-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.input-group {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.input-field {
+  flex: 1;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  color: var(--text-primary);
+  font-size: 0.95rem;
+  font-family: 'Courier New', monospace;
+  transition: border-color 0.2s;
+}
+
+.input-field:focus {
+  outline: none;
+  border-color: var(--accent-alt);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+}
+
+.btn-primary {
+  background: var(--accent-alt);
+  color: #fff;
+  border: none;
+  padding: 12px 24px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.btn-primary:hover {
+  background: #65b1ff;
+  box-shadow: 0 0 20px rgba(88, 166, 255, 0.3);
+}
+
+.btn-primary:active {
+  transform: scale(0.98);
+}
+
+.command-history {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.history-item {
+  padding: 8px;
+  border-left: 3px solid var(--accent);
+  margin-bottom: 6px;
+  color: var(--text-primary);
+  background: var(--bg-secondary);
+  border-radius: 4px;
+}
+
+.history-time {
+  color: var(--text-secondary);
+  display: block;
+  font-size: 0.75rem;
+  margin-bottom: 4px;
+}
+
+.suggestions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.suggestion-btn {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.2s;
+  color: var(--accent);
+  text-align: center;
+}
+
+.suggestion-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent)10;
+}
+
+/* SCROLLBAR */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border);
+}
+
+@media (max-width: 768px) {
+  .sidebar { width: 100%; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+  .layout { flex-direction: column; }
+  .header-stats { display: none; }
+}
+
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- PERMISSION CHECK -->
+<div class="permission-overlay" id="permissionOverlay">
+  <div class="permission-modal">
+    <div class="permission-icon">🔐</div>
+    <div class="permission-title">Request Access</div>
+    <div class="permission-subtitle">This application requires the following permissions to operate:</div>
+    
+    <div class="permission-list">
+      <div class="permission-item">
+        <span class="permission-item-icon">✓</span>
+        <span>Execute remote commands</span>
+      </div>
+      <div class="permission-item">
+        <span class="permission-item-icon">✓</span>
+        <span>View system information</span>
+      </div>
+      <div class="permission-item">
+        <span class="permission-item-icon">✓</span>
+        <span>Control input devices</span>
+      </div>
+      <div class="permission-item">
+        <span class="permission-item-icon">✓</span>
+        <span>Access file system</span>
+      </div>
+    </div>
+    
+    <div class="permission-buttons">
+      <button class="btn-permission btn-allow" onclick="grantPermission()">Allow</button>
+      <button class="btn-permission btn-deny" onclick="denyPermission()">Deny</button>
+    </div>
+  </div>
+</div>
+
+<!-- PASSWORD PROTECTION -->
+<div class="password-overlay" id="passwordOverlay">
+  <div class="password-modal">
+    <div class="password-icon">🔑</div>
+    <div class="password-title">Admin Access</div>
+    <div class="password-subtitle">Enter the admin password to continue</div>
+    
+    <div class="error-message" id="errorMessage">Incorrect password. Try again.</div>
+    
+    <input 
+      type="password" 
+      id="passwordInput" 
+      class="password-input" 
+      placeholder="Enter password" 
+      onkeypress="handlePasswordKeypress(event)"
+      autocomplete="off"
+    >
+    
+    <button class="btn-unlock" id="unlockBtn" onclick="verifyPassword()">Unlock</button>
+  </div>
+</div>
+
+<!-- BLOCKED SCREEN -->
+<div class="blocked-screen" id="blockedScreen">
+  <div class="blocked-content">
+    <div class="blocked-icon">🚫</div>
+    <div class="blocked-title">Access Denied</div>
+    <div class="blocked-text">
+      You have been blocked from accessing this panel<br>
+      due to multiple incorrect password attempts or<br>
+      permission denial.
+    </div>
+    <p style="color: var(--text-secondary); font-size: 0.85rem;">This message cannot be dismissed.</p>
+  </div>
+</div>
+
+<!-- MAIN INTERFACE -->
+<div class="layout" id="mainLayout" style="display: none;">
+  
+  <aside class="sidebar">
+    <div class="logo-section">
+      <div class="logo-icon">🖥</div>
+      <div>
+        <div class="logo-text">Remote Control</div>
+        <span class="logo-sub">Admin Panel</span>
+      </div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Navigation</div>
+      <div class="nav-item active" onclick="switchTab('dashboard')">📊 Dashboard</div>
+      <div class="nav-item" onclick="switchTab('commands')">⚡ Commands</div>
+      <div class="nav-item" onclick="switchTab('settings')">⚙️ Settings</div>
+    </div>
+
+    <div class="nav-section" style="flex: 1; overflow-y: auto;">
+      <div class="nav-label">Scripts</div>
+      <div id="scriptsList"></div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Session</div>
+      <div class="nav-item" onclick="logout()" style="color: var(--danger);">🚪 Logout</div>
+    </div>
+  </aside>
+
+  <div class="main-content">
+    <div class="header">
+      <div class="header-title">Remote Control Admin Panel</div>
+      <div class="header-stats">
+        <div class="stat">Connected: <span class="stat-value" id="connectedCount">0</span></div>
+        <div class="stat">Commands: <span class="stat-value" id="commandCount">0</span></div>
+        <div class="stat" id="sessionTime">Session: 0m</div>
+      </div>
+    </div>
+
+    <div class="content-area">
+      <!-- DASHBOARD TAB -->
+      <div id="dashboard-tab">
+        <div class="card">
+          <div class="card-title">📊 System Overview</div>
+          <div id="systemOverview" style="color: var(--text-secondary);">
+            Loading system information...
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">🎯 Quick Commands</div>
+          <div class="suggestions-grid">
+            <button class="suggestion-btn" onclick="quickCommand('status')">Status</button>
+            <button class="suggestion-btn" onclick="quickCommand('screenshot')">Screenshot</button>
+            <button class="suggestion-btn" onclick="quickCommand('lock')">Lock</button>
+            <button class="suggestion-btn" onclick="quickCommand('shutdown 60')">Shutdown</button>
+            <button class="suggestion-btn" onclick="quickCommand('restart 60')">Restart</button>
+            <button class="suggestion-btn" onclick="quickCommand('battery')">Battery</button>
+            <button class="suggestion-btn" onclick="quickCommand('cpu')">CPU</button>
+            <button class="suggestion-btn" onclick="quickCommand('ram')">RAM</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- COMMANDS TAB -->
+      <div id="commands-tab" style="display: none;">
+        <div class="card">
+          <div class="card-title">⚡ Command Console</div>
+          <div class="input-group">
+            <input 
+              type="text" 
+              id="cmdInput" 
+              class="input-field" 
+              placeholder="screenshot /and lock /and notify Done"
+              onkeypress="handleCommandKeypress(event)"
+            >
+            <button class="btn-primary" onclick="sendCommand()">Send</button>
+          </div>
+          <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 12px;">
+            💡 Tip: Use <code>/and</code> to chain commands. If any fails, chain stops (exit on error).
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">📜 Command History</div>
+          <div class="command-history" id="historyList">
+            <div style="color: var(--text-secondary);">No commands yet</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SETTINGS TAB -->
+      <div id="settings-tab" style="display: none;">
+        <div class="card">
+          <div class="card-title">⚙️ Admin Settings</div>
+          <p style="color: var(--text-secondary); margin-bottom: 16px;">
+            Session timeout: 30 minutes<br>
+            Last login: <span id="lastLogin">Just now</span>
+          </p>
+          <button class="btn-primary" style="background: var(--danger);" onclick="logout()">
+            🚪 Logout
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════════════
+// PERMISSION & PASSWORD SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+let isAccessDenied = false;
+let passwordAttempts = 0;
+const MAX_PASSWORD_ATTEMPTS = 5;
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+let sessionStart = Date.now();
+
+function denyPermission() {
+  isAccessDenied = true;
+  document.getElementById('permissionOverlay').style.display = 'none';
+  showBlockedScreen('Permission denied by user');
+}
+
+function grantPermission() {
+  localStorage.setItem('permissionGranted', 'true');
+  document.getElementById('permissionOverlay').style.display = 'none';
+  showPasswordPrompt();
+}
+
+function showPasswordPrompt() {
+  document.getElementById('passwordOverlay').classList.add('active');
+  document.getElementById('passwordInput').focus();
+}
+
+function handlePasswordKeypress(e) {
+  if (e.key === 'Enter') verifyPassword();
+}
+
+function verifyPassword() {
+  const pwd = document.getElementById('passwordInput').value;
+  const adminKey = localStorage.getItem('admin_key') || prompt('Set admin password (first time only):');
+  
+  if (!adminKey) {
+    localStorage.setItem('admin_key', pwd);
+    loginSuccess();
+    return;
+  }
+  
+  if (pwd === adminKey) {
+    loginSuccess();
+  } else {
+    passwordAttempts++;
+    document.getElementById('errorMessage').classList.add('show');
+    document.getElementById('passwordInput').classList.add('error');
+    
+    if (passwordAttempts >= MAX_PASSWORD_ATTEMPTS) {
+      setTimeout(() => {
+        document.getElementById('passwordOverlay').classList.remove('active');
+        showBlockedScreen('Too many incorrect password attempts');
+      }, 1500);
+    } else {
+      setTimeout(() => {
+        document.getElementById('passwordInput').value = '';
+        document.getElementById('passwordInput').classList.remove('error');
+        document.getElementById('errorMessage').classList.remove('show');
+      }, 1000);
+    }
+  }
+}
+
+function loginSuccess() {
+  document.getElementById('passwordOverlay').classList.remove('active');
+  document.getElementById('mainLayout').style.display = 'flex';
+  localStorage.setItem('lastLogin', new Date().toLocaleString());
+  initDashboard();
+}
+
+function showBlockedScreen(reason) {
+  isAccessDenied = true;
+  document.getElementById('blockedScreen').classList.add('show');
+  // Block all reloads and navigation
+  window.onbeforeunload = () => true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// DASHBOARD LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════════
+
+let selectedScript = null;
+let commandCount = 0;
+const COMMANDS = ['screenshot', 'lock', 'shutdown', 'restart', 'status', 'cpu', 'ram', 'disk', 'processes', 'notify', 'type_text'];
+
+async function fetchAPI(endpoint, method = 'GET', body = null) {
+  try {
+    const opts = { method, headers: { 'X-Admin-Key': localStorage.getItem('admin_key') } };
+    if (body) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const r = await fetch(endpoint, opts);
+    if (r.status === 401) logout();
+    return await r.json();
+  } catch (e) {
+    console.error('API Error:', e);
+  }
+}
+
+async function loadScripts() {
+  const data = await fetchAPI('/api/scripts');
+  if (!data) return;
+  
+  const list = document.getElementById('scriptsList');
+  list.innerHTML = '';
+  document.getElementById('connectedCount').textContent = data.scripts.filter(s => s.connected).length;
+  
+  data.scripts.forEach(s => {
+    const div = document.createElement('div');
+    div.className = `script-item ${s.connected ? 'active' : ''}`;
+    div.onclick = () => selectScript(s.name);
+    div.innerHTML = `
+      <span>${s.name}</span>
+      <span class="script-status ${s.connected ? 'online' : ''}"></span>
+    `;
+    list.appendChild(div);
+  });
+}
+
+function selectScript(name) {
+  selectedScript = name;
+  document.querySelectorAll('.script-item').forEach(el => el.classList.remove('active'));
+  event.target.closest('.script-item').classList.add('active');
+}
+
+async function sendCommand() {
+  const input = document.getElementById('cmdInput');
+  const cmd = input.value.trim();
+  
+  if (!cmd) {
+    alert('Enter a command');
+    return;
+  }
+  
+  if (!selectedScript) {
+    alert('Select a script first');
+    return;
+  }
+  
+  input.disabled = true;
+  const parts = cmd.split(/\s+\/and\s+/);
+  let executed = 0;
+  
+  for (const part of parts) {
+    try {
+      await fetchAPI('/api/send', 'POST', { script: selectedScript, command: part.trim() });
+      executed++;
+      commandCount++;
+      addHistory(`${selectedScript}: ${part.trim()}`);
+      await new Promise(r => setTimeout(r, 200));
+    } catch (e) {
+      // CHAIN STOPS ON ERROR (exit on error)
+      addHistory(`❌ Chain stopped: ${part.trim()}`);
+      break;
+    }
+  }
+  
+  document.getElementById('commandCount').textContent = commandCount;
+  input.value = '';
+  input.disabled = false;
+  input.focus();
+}
+
+function quickCommand(cmd) {
+  document.getElementById('cmdInput').value = cmd;
+  switchTab('commands');
+  setTimeout(() => sendCommand(), 100);
+}
+
+function handleCommandKeypress(e) {
+  if (e.key === 'Enter') sendCommand();
+}
+
+function addHistory(text) {
+  const list = document.getElementById('historyList');
+  if (list.textContent.includes('No commands')) {
+    list.innerHTML = '';
+  }
+  
+  const item = document.createElement('div');
+  item.className = 'history-item';
+  const now = new Date().toLocaleTimeString();
+  item.innerHTML = `<span class="history-time">${now}</span>${text}`;
+  list.insertBefore(item, list.firstChild);
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('[id$="-tab"]').forEach(el => el.style.display = 'none');
+  document.getElementById(tab + '-tab').style.display = 'block';
+  
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  event.target.classList.add('active');
+}
+
+function logout() {
+  localStorage.removeItem('admin_key');
+  localStorage.removeItem('permissionGranted');
+  location.reload();
+}
+
+// SESSION TIMER
+setInterval(() => {
+  const elapsed = Date.now() - sessionStart;
+  const mins = Math.floor(elapsed / 60000);
+  document.getElementById('sessionTime').textContent = `Session: ${mins}m`;
+  
+  if (elapsed > SESSION_TIMEOUT) {
+    logout();
+  }
+}, 1000);
+
+// INIT
+function initDashboard() {
+  document.getElementById('lastLogin').textContent = localStorage.getItem('lastLogin') || 'Just now';
+  loadScripts();
+  setInterval(loadScripts, 3000);
+}
+
+// ON LOAD
+window.addEventListener('load', () => {
+  if (isAccessDenied) return;
+  
+  const permGranted = localStorage.getItem('permissionGranted');
+  const adminKey = localStorage.getItem('admin_key');
+  
+  if (!permGranted) {
+    document.getElementById('permissionOverlay').style.display = 'flex';
+  } else if (!adminKey || passwordAttempts === 0) {
+    showPasswordPrompt();
+  } else {
+    loginSuccess();
+  }
+});
+
+// PREVENT RELOAD IF BLOCKED
+window.addEventListener('beforeunload', (e) => {
+  if (isAccessDenied) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+// PREVENT BACK BUTTON
+history.pushState(null, null, location.href);
+window.addEventListener('popstate', () => {
+  history.pushState(null, null, location.href);
+});
+</script>
+
+</body>
+</html>
