@@ -181,14 +181,7 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     name, cmd = parts[0], parts[1]
 
-    # Script never registered at all
-    if name not in clients and name not in last_seen:
-        online = [n for n, w in clients.items() if _is_alive(w)]
-        await update.message.reply_text(
-            f"❌ Script '{name}' not found.\n"
-            f"Online: {', '.join(online) or 'none'}"
-        )
-        return
+  
 
     # Build payload
     payload = {
