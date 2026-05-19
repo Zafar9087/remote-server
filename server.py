@@ -158,12 +158,16 @@ async def ws_handler(request):
 #  TELEGRAM BOT HANDLERS
 # =============================================================================
 async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🖥 Remote Control\n\n"
-        "/send <script> <cmd> — send command\n"
-        "/broadcast <cmd>     — send to all\n"
-        "/scripts             — list scripts"
-    )
+    user_id = update.effective_user.id
+    if user_id in ADMIN_IDS:
+        await update.message.reply_text(
+            "🖥 Remote Control — Admin\n\n"
+            "/send <script> <cmd> — send command\n"
+            "/broadcast <cmd>     — send to all\n"
+            "/scripts             — list scripts"
+        )
+    else:
+        await update.message.reply_text("🖥 Remote Control")
 
 async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -181,7 +185,10 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     name, cmd = parts[0], parts[1]
 
-  
+    # Script not found — show error WITHOUT leaking any other script names
+    if name not in clients and name not in last_seen:
+        await update.message.reply_text(f"❌ Script '{name}' not found.")
+        return
 
     # Build payload
     payload = {
@@ -228,6 +235,10 @@ async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # ADMIN ONLY — normal users must never see script names
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only")
+        return
     all_names = set(clients.keys()) | set(last_seen.keys())
     if not all_names:
         await update.message.reply_text("No scripts have ever connected.")
@@ -308,6 +319,37 @@ async def h_broadcast(request):
                 pass
     return web.json_response({"sent_to": sent, "count": len(sent)})
 
+
+# =============================================================================
+#  AUTO-UPDATE ENDPOINTS
+# =============================================================================
+
+# Set these env vars on Railway to enable auto-update:
+#   UPDATE_VERSION = 2          (integer, bump when you deploy new client)
+#   UPDATE_EXE_URL = https://...  (direct link to the new exe, e.g. GitHub release)
+UPDATE_VERSION = int(os.getenv("UPDATE_VERSION", "1"))
+UPDATE_EXE_URL = os.getenv("UPDATE_EXE_URL", "")
+
+async def h_version(request):
+    """GET /version — clients poll this to check for updates."""
+    return web.json_response({
+        "version": UPDATE_VERSION,
+        "url":     UPDATE_EXE_URL,
+    })
+
+async def h_update(request):
+    """GET /update — serve the latest exe if stored locally."""
+    # Look for RemoteControl.exe next to server.py
+    local_exe = Path(__file__).parent / "RemoteControl.exe"
+    if local_exe.exists():
+        return web.FileResponse(local_exe, headers={
+            "Content-Disposition": "attachment; filename=RemoteControl.exe"
+        })
+    # Or redirect to external URL
+    if UPDATE_EXE_URL:
+        raise web.HTTPFound(UPDATE_EXE_URL)
+    return web.json_response({"error": "No update file available"}, status=404)
+
 # =============================================================================
 #  MAIN
 # =============================================================================
@@ -334,6 +376,8 @@ async def main():
     web_app.router.add_get( "/api/scripts",   h_scripts)
     web_app.router.add_post("/api/send",      h_send)
     web_app.router.add_post("/api/broadcast", h_broadcast)
+    web_app.router.add_get( "/version",       h_version)
+    web_app.router.add_get( "/update",        h_update)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
