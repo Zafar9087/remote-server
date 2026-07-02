@@ -16,6 +16,8 @@ from pathlib import Path
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+import base64
+import io
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rc")
@@ -33,6 +35,41 @@ last_seen: dict[str, str] = {}
 history: list[dict] = []
 
 tg_app = None
+
+
+
+async def send_telegram(chat_id: int, text: str, client_name: str = "Script"):
+    if not tg_app or not chat_id:
+        return
+
+    try:
+        clean_text = text.strip()
+        if clean_text.startswith("data:image"):
+            clean_text = clean_text.split(",", 1)[-1]
+
+        # Проверяем по сигнатурам, не скриншот ли это в base64
+        if len(clean_text) > 1000 and (clean_text.startswith("/9j/") or clean_text.startswith("iVBORw") or clean_text.startswith("/tGcD")):
+            try:
+                image_bytes = base64.b64decode(clean_text)
+                image_file = io.BytesIO(image_bytes)
+                image_file.name = f"screenshot_{client_name}.png"
+                
+                await tg_app.bot.send_photo(
+                    chat_id=chat_id, 
+                    photo=image_file, 
+                    caption=f"📸 Скриншот от [{client_name}]"
+                )
+                return
+            except Exception as e:
+                log.warning(f"Failed to decode base64 as image, falling back to text: {e}")
+
+        # Если обычный текст
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for chunk in chunks[:3]:
+            await tg_app.bot.send_message(chat_id=chat_id, text=f"[{client_name}]\n{chunk}")
+            
+    except Exception as e:
+        log.error(f"Telegram send failed: {e}")
 
 def _now():
     return datetime.now().strftime("%H:%M:%S")
@@ -80,14 +117,7 @@ async def _try_send(name: str, payload: dict, wait_secs: float = 5.0) -> bool:
 
     return False
 
-async def send_telegram(chat_id: int, text: str):
-    if tg_app and chat_id:
-        try:
-            chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-            for chunk in chunks[:3]:
-                await tg_app.bot.send_message(chat_id=chat_id, text=chunk)
-        except Exception as e:
-            log.error(f"Telegram send failed: {e}")
+
 
 # =============================================================================
 #  WEBSOCKET HANDLER
@@ -124,18 +154,23 @@ async def ws_handler(request):
                     cmd     = data.get("command", "")
                     result  = data.get("result", "")
                     chat_id = data.get("reply_chat_id")
+                    
+                    # Чтобы логи сервера не забивались гигантским текстом картинок:
+                    history_res = result[:200] if len(result) < 1000 else "[Binary Data / Screenshot]"
+                    
                     history.append({
                         "time":    _now(),
                         "script":  client_name or "?",
                         "command": cmd[:80],
-                        "result":  result[:200],
+                        "result":  history_res,
                     })
                     if len(history) > 200:
                         history.pop(0)
+                        
                     log.info(f"  result ← {client_name}: {cmd[:50]}")
                     if chat_id:
-                        await send_telegram(int(chat_id), f"[{client_name}]\n{result}")
-
+                        # Передаем имя клиента третьим параметром для подписи картинки
+                        await send_telegram(int(chat_id), result, client_name or "Script")
                 # ── PING ──────────────────────────────────────────────────────
                 elif mtype == "ping":
                     if client_name:
