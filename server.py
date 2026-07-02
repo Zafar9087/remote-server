@@ -12,6 +12,7 @@ Send flow:
 
 import asyncio, json, logging, os
 from datetime import datetime
+from pathlib import Path
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -260,6 +261,10 @@ async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 #  HTTP API
 # =============================================================================
+async def h_keepalive_ping(request):
+    """Специальный эндпоинт для UptimeRobot, чтобы сервер никогда не спал"""
+    return web.Response(text="Я живой!")
+
 async def h_status(request):
     online  = [n for n, w in clients.items() if _is_alive(w)]
     offline = [n for n in (set(clients) | set(last_seen)) if n not in online]
@@ -371,7 +376,11 @@ async def main():
         log.warning("BOT_TOKEN not set — bot disabled")
 
     web_app = web.Application()
-    web_app.router.add_get( "/ws",            ws_handler)
+    
+    # Роут специально для UptimeRobot (Главная страница)
+    web_app.router.add_get( "/",              h_keepalive_ping)
+    
+    web_app.router.add_get( "/ws",             ws_handler)
     web_app.router.add_get( "/api/status",    h_status)
     web_app.router.add_get( "/api/scripts",   h_scripts)
     web_app.router.add_post("/api/send",      h_send)
