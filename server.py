@@ -1,128 +1,156 @@
 """
-Remote Control Server — RELIABLE CONNECTION
-============================================
-No stale "connected" flags.
-Truth = the WebSocket object itself.
-Send flow:
-  1. Try to send command
-  2. If send succeeds → reply "Sent"
-  3. If send fails → wait up to 5s for client to reconnect, retry once
-  4. If still fails → reply "Not connected"
+Remote Control Server — финальная версия
+=========================================
+HTTP (aiohttp) + WebSocket для стабильной связи с клиентами.
+Telegram-бот и REST API для удалённого управления.
 """
 
-import asyncio, json, logging, os
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
 from datetime import datetime
 from pathlib import Path
+
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import base64
-import io
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rc")
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS  = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
+# ── Конфигурация из переменных окружения ──
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 SECRET_KEY = os.getenv("SECRET_KEY", "changeme")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8080")
-PORT       = int(os.getenv("PORT", 8080))
-
-# clients[name] = WebSocketResponse object (or None if disconnected)
-# The WS object itself is the truth — no separate "connected" bool needed
-clients: dict[str, web.WebSocketResponse] = {}
-last_seen: dict[str, str] = {}
-history: list[dict] = []
-
-tg_app = None
+PORT = int(os.getenv("PORT", 8080))
+UPDATE_VERSION = int(os.getenv("UPDATE_VERSION", "1"))
+UPDATE_EXE_URL = os.getenv("UPDATE_EXE_URL", "")
 
 
+class ClientRegistry:
+    """Реестр подключённых клиентов. Истина — живой WebSocket-объект."""
 
-async def send_telegram(chat_id: int, text: str, client_name: str = "Script"):
+    def __init__(self):
+        self.clients: dict[str, web.WebSocketResponse | None] = {}
+        self.last_seen: dict[str, str] = {}
+        self.history: list[dict] = []
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    @staticmethod
+    def is_alive(ws: web.WebSocketResponse | None) -> bool:
+        if ws is None:
+            return False
+        try:
+            return not ws.closed
+        except Exception:
+            return False
+
+    async def try_send(self, name: str, payload: dict, wait_secs: float = 5.0) -> bool:
+        """Отправка команды с ожиданием переподключения клиента."""
+        ws = self.clients.get(name)
+
+        if self.is_alive(ws):
+            try:
+                await ws.send_json(payload)
+                return True
+            except Exception as e:
+                log.warning(f"Send to '{name}' failed mid-flight: {e}")
+
+        log.info(f"Waiting {wait_secs}s for '{name}' to reconnect...")
+        deadline = asyncio.get_event_loop().time() + wait_secs
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.25)
+            ws = self.clients.get(name)
+            if self.is_alive(ws):
+                try:
+                    await ws.send_json(payload)
+                    log.info(f"'{name}' reconnected — command delivered")
+                    return True
+                except Exception as e:
+                    log.warning(f"Send after reconnect failed: {e}")
+                    break
+        return False
+
+    def register(self, name: str, ws: web.WebSocketResponse) -> None:
+        self.clients[name] = ws
+        self.last_seen[name] = self._now()
+        log.info(f"+ {name} registered")
+
+    def disconnect(self, name: str, ws: web.WebSocketResponse) -> None:
+        if self.clients.get(name) is ws:
+            self.clients[name] = None
+            log.info(f"- {name} disconnected")
+
+    def touch(self, name: str) -> None:
+        self.last_seen[name] = self._now()
+
+    def add_result(self, script: str, command: str, result: str) -> None:
+        history_res = result[:200] if len(result) < 1000 else "[Binary Data / Screenshot]"
+        self.history.append({
+            "time": self._now(),
+            "script": script,
+            "command": command[:80],
+            "result": history_res,
+        })
+        if len(self.history) > 200:
+            self.history.pop(0)
+
+    def all_names(self) -> set[str]:
+        return set(self.clients.keys()) | set(self.last_seen.keys())
+
+    def online_names(self) -> list[str]:
+        return [n for n, w in self.clients.items() if self.is_alive(w)]
+
+
+registry = ClientRegistry()
+tg_app: Application | None = None
+
+
+async def send_telegram(chat_id: int, text: str, client_name: str = "Script") -> None:
+    """Отправка текста или скриншота (base64) в Telegram."""
     if not tg_app or not chat_id:
         return
-
     try:
         clean_text = text.strip()
         if clean_text.startswith("data:image"):
             clean_text = clean_text.split(",", 1)[-1]
 
-        # Проверяем по сигнатурам, не скриншот ли это в base64
-        if len(clean_text) > 1000 and (clean_text.startswith("/9j/") or clean_text.startswith("iVBORw") or clean_text.startswith("/tGcD")):
+        if len(clean_text) > 1000 and (
+            clean_text.startswith("/9j/")
+            or clean_text.startswith("iVBORw")
+            or clean_text.startswith("/tGcD")
+        ):
             try:
                 image_bytes = base64.b64decode(clean_text)
                 image_file = io.BytesIO(image_bytes)
                 image_file.name = f"screenshot_{client_name}.png"
-                
                 await tg_app.bot.send_photo(
-                    chat_id=chat_id, 
-                    photo=image_file, 
-                    caption=f"📸 Скриншот от [{client_name}]"
+                    chat_id=chat_id,
+                    photo=image_file,
+                    caption=f"📸 Скриншот от [{client_name}]",
                 )
                 return
             except Exception as e:
                 log.warning(f"Failed to decode base64 as image, falling back to text: {e}")
 
-        # Если обычный текст
-        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
         for chunk in chunks[:3]:
             await tg_app.bot.send_message(chat_id=chat_id, text=f"[{client_name}]\n{chunk}")
-            
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
 
-def _now():
-    return datetime.now().strftime("%H:%M:%S")
-
-def _is_alive(ws: web.WebSocketResponse) -> bool:
-    """Check if a WebSocket is actually open and usable."""
-    if ws is None:
-        return False
-    try:
-        return not ws.closed
-    except Exception:
-        return False
-
-async def _try_send(name: str, payload: dict, wait_secs: float = 5.0) -> bool:
-    """
-    Try to send payload to client.
-    If the socket is closed, wait up to wait_secs for a reconnect, then retry.
-    Returns True if sent successfully, False otherwise.
-    """
-    ws = clients.get(name)
-
-    # First attempt — socket looks alive
-    if _is_alive(ws):
-        try:
-            await ws.send_json(payload)
-            return True
-        except Exception as e:
-            log.warning(f"Send to '{name}' failed mid-flight: {e}")
-            # Socket died just now — fall through to wait
-
-    # Socket is dead or just died — wait for reconnect
-    log.info(f"Waiting {wait_secs}s for '{name}' to reconnect...")
-    deadline = asyncio.get_event_loop().time() + wait_secs
-    while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(0.25)
-        ws = clients.get(name)
-        if _is_alive(ws):
-            try:
-                await ws.send_json(payload)
-                log.info(f"'{name}' reconnected — command delivered")
-                return True
-            except Exception as e:
-                log.warning(f"Send after reconnect failed: {e}")
-                break   # give up
-
-    return False
-
-
 
 # =============================================================================
-#  WEBSOCKET HANDLER
+#  WebSocket
 # =============================================================================
-async def ws_handler(request):
+async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=25)
     await ws.prepare(request)
     client_name = None
@@ -135,46 +163,28 @@ async def ws_handler(request):
                 data = json.loads(msg.data)
                 mtype = data.get("type", "")
 
-                # ── REGISTER ──────────────────────────────────────────────────
                 if mtype == "register":
-                    name   = data.get("name", "").strip()
+                    name = data.get("name", "").strip()
                     secret = data.get("secret", "")
                     if secret != SECRET_KEY:
                         await ws.send_json({"type": "error", "msg": "Invalid secret key"})
                         await ws.close()
-                        return
+                        return ws
                     client_name = name
-                    clients[name] = ws          # store the live WS object
-                    last_seen[name] = _now()
-                    log.info(f"+ {name} registered")
+                    registry.register(name, ws)
                     await ws.send_json({"type": "ok"})
 
-                # ── RESULT ────────────────────────────────────────────────────
                 elif mtype == "result":
-                    cmd     = data.get("command", "")
-                    result  = data.get("result", "")
+                    cmd = data.get("command", "")
+                    result = data.get("result", "")
                     chat_id = data.get("reply_chat_id")
-                    
-                    # Чтобы логи сервера не забивались гигантским текстом картинок:
-                    history_res = result[:200] if len(result) < 1000 else "[Binary Data / Screenshot]"
-                    
-                    history.append({
-                        "time":    _now(),
-                        "script":  client_name or "?",
-                        "command": cmd[:80],
-                        "result":  history_res,
-                    })
-                    if len(history) > 200:
-                        history.pop(0)
-                        
+                    registry.add_result(client_name or "?", cmd, result)
                     log.info(f"  result ← {client_name}: {cmd[:50]}")
                     if chat_id:
-                        # Передаем имя клиента третьим параметром для подписи картинки
                         await send_telegram(int(chat_id), result, client_name or "Script")
-                # ── PING ──────────────────────────────────────────────────────
-                elif mtype == "ping":
-                    if client_name:
-                        last_seen[client_name] = _now()
+
+                elif mtype == "ping" and client_name:
+                    registry.touch(client_name)
 
             except Exception as e:
                 log.warning(f"msg parse error: {e}")
@@ -182,20 +192,17 @@ async def ws_handler(request):
     except Exception as e:
         log.warning(f"ws error ({client_name}): {e}")
     finally:
-        # Only clear client entry if it's still THIS ws object
-        # (a fast reconnect may have already replaced it)
-        if client_name and clients.get(client_name) is ws:
-            clients[client_name] = None
-            log.info(f"- {client_name} disconnected")
+        if client_name:
+            registry.disconnect(client_name, ws)
 
     return ws
 
+
 # =============================================================================
-#  TELEGRAM BOT HANDLERS
+#  Telegram-бот
 # =============================================================================
-async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in ADMIN_IDS:
+async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id in ADMIN_IDS:
         await update.message.reply_text(
             "🖥 Remote Control — Admin\n\n"
             "/send <script> <cmd> — send command\n"
@@ -205,7 +212,8 @@ async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("🖥 Remote Control")
 
-async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin only")
         return
@@ -220,31 +228,26 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     name, cmd = parts[0], parts[1]
-
-    # Script not found — show error WITHOUT leaking any other script names
-    if name not in clients and name not in last_seen:
+    if name not in registry.clients and name not in registry.last_seen:
         await update.message.reply_text(f"❌ Script '{name}' not found.")
         return
 
-    # Build payload
     payload = {
-        "type":          "command",
-        "command":       cmd,
+        "type": "command",
+        "command": cmd,
         "reply_chat_id": update.effective_chat.id,
     }
-
-    # Send with wait-and-retry
-    ok = await _try_send(name, payload, wait_secs=5.0)
-
+    ok = await registry.try_send(name, payload)
     if ok:
         await update.message.reply_text(f"✅ Sent to {name}")
     else:
         await update.message.reply_text(
             f"❌ '{name}' is not connected.\n"
-            f"Last seen: {last_seen.get(name, 'never')}"
+            f"Last seen: {registry.last_seen.get(name, 'never')}"
         )
 
-async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin only")
         return
@@ -254,12 +257,12 @@ async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     sent = []
-    for name, ws in clients.items():
-        if _is_alive(ws):
+    for name, ws in registry.clients.items():
+        if registry.is_alive(ws):
             try:
                 await ws.send_json({
-                    "type":          "command",
-                    "command":       cmd,
+                    "type": "command",
+                    "command": cmd,
                     "reply_chat_id": update.effective_chat.id,
                 })
                 sent.append(name)
@@ -270,57 +273,61 @@ async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📡 Broadcast to {len(sent)}: {', '.join(sent) or 'none'}"
     )
 
-async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # ADMIN ONLY — normal users must never see script names
+
+async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin only")
         return
-    all_names = set(clients.keys()) | set(last_seen.keys())
+    all_names = registry.all_names()
     if not all_names:
         await update.message.reply_text("No scripts have ever connected.")
         return
     msg = "📋 Scripts:\n\n"
     for name in sorted(all_names):
-        ws = clients.get(name)
-        icon = "🟢" if _is_alive(ws) else "🔴"
-        seen = last_seen.get(name, "never")
+        ws = registry.clients.get(name)
+        icon = "🟢" if registry.is_alive(ws) else "🔴"
+        seen = registry.last_seen.get(name, "never")
         msg += f"{icon} {name}  (last seen: {seen})\n"
     await update.message.reply_text(msg)
 
-async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Admin only")
         return
     await update.message.reply_text(f"🌐 Admin Panel:\n{PUBLIC_URL}/admin\nKey: {SECRET_KEY}")
 
+
 # =============================================================================
 #  HTTP API
 # =============================================================================
-async def h_keepalive_ping(request):
-    """Специальный эндпоинт для UptimeRobot, чтобы сервер никогда не спал"""
+async def h_keepalive_ping(request: web.Request) -> web.Response:
+    """Эндпоинт для UptimeRobot — сервер не засыпает."""
     return web.Response(text="Я живой!")
 
-async def h_status(request):
-    online  = [n for n, w in clients.items() if _is_alive(w)]
-    offline = [n for n in (set(clients) | set(last_seen)) if n not in online]
+
+async def h_status(request: web.Request) -> web.Response:
+    online = registry.online_names()
+    offline = [n for n in registry.all_names() if n not in online]
     return web.json_response({"status": "ok", "online": online, "offline": offline})
 
-async def h_scripts(request):
+
+async def h_scripts(request: web.Request) -> web.Response:
     if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
         return web.json_response({"error": "Unauthorized"}, status=401)
-    all_names = set(clients.keys()) | set(last_seen.keys())
     scripts = [
         {
-            "name":      n,
-            "connected": _is_alive(clients.get(n)),
-            "last_seen": last_seen.get(n, "never"),
+            "name": n,
+            "connected": registry.is_alive(registry.clients.get(n)),
+            "last_seen": registry.last_seen.get(n, "never"),
         }
-        for n in sorted(all_names)
+        for n in sorted(registry.all_names())
     ]
     scripts.sort(key=lambda x: (not x["connected"], x["name"]))
-    return web.json_response({"scripts": scripts, "history": history[-30:]})
+    return web.json_response({"scripts": scripts, "history": registry.history[-30:]})
 
-async def h_send(request):
+
+async def h_send(request: web.Request) -> web.Response:
     if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
@@ -329,17 +336,18 @@ async def h_send(request):
         return web.json_response({"error": "Bad JSON"}, status=400)
 
     name = data.get("script", "").strip()
-    cmd  = data.get("command", "").strip()
+    cmd = data.get("command", "").strip()
     if not name or not cmd:
         return web.json_response({"error": "script and command required"}, status=400)
 
     payload = {"type": "command", "command": cmd, "reply_chat_id": data.get("reply_chat_id")}
-    ok = await _try_send(name, payload, wait_secs=5.0)
+    ok = await registry.try_send(name, payload)
     if ok:
         return web.json_response({"status": "sent"})
     return web.json_response({"error": f"'{name}' not connected"}, status=503)
 
-async def h_broadcast(request):
+
+async def h_broadcast(request: web.Request) -> web.Response:
     if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
@@ -349,9 +357,10 @@ async def h_broadcast(request):
     cmd = data.get("command", "").strip()
     if not cmd:
         return web.json_response({"error": "command required"}, status=400)
+
     sent = []
-    for name, ws in clients.items():
-        if _is_alive(ws):
+    for name, ws in registry.clients.items():
+        if registry.is_alive(ws):
             try:
                 await ws.send_json({"type": "command", "command": cmd})
                 sent.append(name)
@@ -360,49 +369,37 @@ async def h_broadcast(request):
     return web.json_response({"sent_to": sent, "count": len(sent)})
 
 
-# =============================================================================
-#  AUTO-UPDATE ENDPOINTS
-# =============================================================================
+async def h_version(request: web.Request) -> web.Response:
+    """GET /version — клиенты проверяют наличие обновлений."""
+    return web.json_response({"version": UPDATE_VERSION, "url": UPDATE_EXE_URL})
 
-# Set these env vars on Railway to enable auto-update:
-#   UPDATE_VERSION = 2          (integer, bump when you deploy new client)
-#   UPDATE_EXE_URL = https://...  (direct link to the new exe, e.g. GitHub release)
-UPDATE_VERSION = int(os.getenv("UPDATE_VERSION", "1"))
-UPDATE_EXE_URL = os.getenv("UPDATE_EXE_URL", "")
 
-async def h_version(request):
-    """GET /version — clients poll this to check for updates."""
-    return web.json_response({
-        "version": UPDATE_VERSION,
-        "url":     UPDATE_EXE_URL,
-    })
-
-async def h_update(request):
-    """GET /update — serve the latest exe if stored locally."""
-    # Look for RemoteControl.exe next to server.py
+async def h_update(request: web.Request) -> web.Response:
+    """GET /update — отдача актуального exe."""
     local_exe = Path(__file__).parent / "RemoteControl.exe"
     if local_exe.exists():
-        return web.FileResponse(local_exe, headers={
-            "Content-Disposition": "attachment; filename=RemoteControl.exe"
-        })
-    # Or redirect to external URL
+        return web.FileResponse(
+            local_exe,
+            headers={"Content-Disposition": "attachment; filename=RemoteControl.exe"},
+        )
     if UPDATE_EXE_URL:
         raise web.HTTPFound(UPDATE_EXE_URL)
     return web.json_response({"error": "No update file available"}, status=404)
 
+
 # =============================================================================
-#  MAIN
+#  Запуск
 # =============================================================================
-async def main():
+async def main() -> None:
     global tg_app
 
     if BOT_TOKEN:
         tg_app = Application.builder().token(BOT_TOKEN).build()
-        tg_app.add_handler(CommandHandler("start",     tg_start))
-        tg_app.add_handler(CommandHandler("send",      tg_send))
+        tg_app.add_handler(CommandHandler("start", tg_start))
+        tg_app.add_handler(CommandHandler("send", tg_send))
         tg_app.add_handler(CommandHandler("broadcast", tg_broadcast))
-        tg_app.add_handler(CommandHandler("scripts",   tg_scripts))
-        tg_app.add_handler(CommandHandler("panel",     tg_panel))
+        tg_app.add_handler(CommandHandler("scripts", tg_scripts))
+        tg_app.add_handler(CommandHandler("panel", tg_panel))
         await tg_app.initialize()
         await tg_app.start()
         asyncio.create_task(tg_app.updater.start_polling())
@@ -411,24 +408,21 @@ async def main():
         log.warning("BOT_TOKEN not set — bot disabled")
 
     web_app = web.Application()
-    
-    # Роут специально для UptimeRobot (Главная страница)
-    web_app.router.add_get( "/",              h_keepalive_ping)
-    
-    web_app.router.add_get( "/ws",             ws_handler)
-    web_app.router.add_get( "/api/status",    h_status)
-    web_app.router.add_get( "/api/scripts",   h_scripts)
-    web_app.router.add_post("/api/send",      h_send)
+    web_app.router.add_get("/", h_keepalive_ping)
+    web_app.router.add_get("/ws", ws_handler)
+    web_app.router.add_get("/api/status", h_status)
+    web_app.router.add_get("/api/scripts", h_scripts)
+    web_app.router.add_post("/api/send", h_send)
     web_app.router.add_post("/api/broadcast", h_broadcast)
-    web_app.router.add_get( "/version",       h_version)
-    web_app.router.add_get( "/update",        h_update)
+    web_app.router.add_get("/version", h_version)
+    web_app.router.add_get("/update", h_update)
 
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
     log.info(f"✓ Server on port {PORT}")
-    log.info(f"✓ WS: {PUBLIC_URL.replace('http','ws')}/ws")
+    log.info(f"✓ WS: {PUBLIC_URL.replace('http', 'ws')}/ws")
 
     try:
         await asyncio.Future()
@@ -436,6 +430,7 @@ async def main():
         pass
     finally:
         await runner.cleanup()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
