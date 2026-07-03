@@ -22,8 +22,8 @@ log = logging.getLogger("rc")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-SECRET_KEY = os.getenv("SECRET_KEY", "changeme")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8080")
+SECRET_KEY = os.getenv("SECRET_KEY", "Zafarjon1224")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://remote-server-mr8v.onrender.com")
 PORT = int(os.getenv("PORT", 8080))
 UPDATE_VERSION = int(os.getenv("UPDATE_VERSION", "1"))
 UPDATE_EXE_URL = os.getenv("UPDATE_EXE_URL", "")
@@ -117,16 +117,19 @@ registry = ClientRegistry()
 tg_app: Application | None = None
 
 USER_COMMANDS = {
-    "Выключить": "shutdown",
-    "Заблокировать": "lock",
-    "Сделать скриншот": "screenshot",
-    "Перезагрузка": "restart",
+    "Power off": "shutdown",
+    "Lock screen": "lock",
+    "Screenshot": "screenshot",
+    "Restart": "restart",
+    "System info": "sysinfo",
+    "Battery": "battery",
 }
 
 USER_MENU = ReplyKeyboardMarkup(
     [
-        ["Выключить", "Заблокировать"],
-        ["Сделать скриншот", "Перезагрузка"],
+        ["Screenshot", "Lock screen"],
+        ["System info", "Battery"],
+        ["Restart", "Power off"],
     ],
     resize_keyboard=True,
 )
@@ -187,7 +190,7 @@ async def send_telegram(chat_id: int, text: str, client_name: str = "Script") ->
             await tg_app.bot.send_photo(
                 chat_id=chat_id,
                 photo=image_file,
-                caption=f"📸 Скриншот от [{client_name}]",
+                caption=f"Screenshot from {client_name}",
             )
             return
 
@@ -258,26 +261,33 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id in ADMIN_IDS:
         await update.message.reply_text(
-            "🖥 Remote Control — Admin\n\n"
-            "/send <script> <cmd>\n/broadcast <cmd>\n/scripts"
+            "Remote Control Admin\n\n"
+            "/scripts - show computers\n"
+            "/sessions - show user links\n"
+            "/send <computer> <command>\n"
+            "/broadcast <command>\n"
+            "/panel - admin panel details"
         )
     else:
-        await update.message.reply_text("🖥 Remote Control")
+        await update.message.reply_text("Remote Control")
 
 
 async def tg_start_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id in ADMIN_IDS:
         await update.message.reply_text(
-            "Remote Control - Admin\n\n"
-            "/send <script> <cmd>\n"
-            "/broadcast <cmd>\n"
+            "Remote Control Admin\n\n"
+            "Use /scripts to see connected computers.\n"
+            "Use /send <computer> <command> to run one command.\n"
+            "Use /broadcast <command> to run a command on every online computer.\n\n"
+            "Commands:\n"
             "/scripts\n"
-            "/sessions"
+            "/sessions\n"
+            "/panel"
         )
         return
 
     await update.message.reply_text(
-        "Введите уникальное имя ПК для подключения.",
+        "Send your computer name to connect. Ask the admin if you do not know it.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -291,12 +301,17 @@ async def tg_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No active sessions.")
         return
 
-    lines = ["Active sessions:"]
+    lines = ["Active sessions", ""]
     for name in sorted(active_sessions):
         session = active_sessions[name]
-        connected = "online" if session.get("connected") else "offline"
+        connected = "Online" if session.get("connected") else "Offline"
         user_id = session.get("tg_user_id") or "not bound"
-        lines.append(f"{name}: {connected}, user={user_id}, last={session.get('last_seen', 'never')}")
+        lines.append(
+            f"{name}\n"
+            f"Status: {connected}\n"
+            f"User: {user_id}\n"
+            f"Last seen: {session.get('last_seen', 'never')}\n"
+        )
     await update.message.reply_text("\n".join(lines))
 
 
@@ -305,13 +320,13 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
 
     if user_id in ADMIN_IDS:
-        await update.message.reply_text("Admin commands: /send, /broadcast, /scripts, /sessions")
+        await update.message.reply_text("Admin commands: /scripts, /sessions, /send, /broadcast, /panel")
         return
 
     bound_pc = user_bindings.get(user_id)
     if bound_pc:
         if text not in USER_COMMANDS:
-            await update.message.reply_text("Команда недоступна.", reply_markup=USER_MENU)
+            await update.message.reply_text("Choose a command from the menu.", reply_markup=USER_MENU)
             return
 
         cmd = USER_COMMANDS[text]
@@ -321,23 +336,23 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "reply_chat_id": update.effective_chat.id,
         })
         if ok:
-            await update.message.reply_text(f"Команда отправлена: {text}", reply_markup=USER_MENU)
+            await update.message.reply_text(f"Sent: {text}", reply_markup=USER_MENU)
         else:
             await update.message.reply_text(
-                f"ПК '{bound_pc}' сейчас не подключен. Админ уведомлен.",
+                f"{bound_pc} is offline right now. The admin was notified.",
                 reply_markup=USER_MENU,
             )
-            await notify_admins(f"Проблема у юзера {user_id}: ПК {bound_pc} недоступен")
+            await notify_admins(f"User {user_id} tried to use {bound_pc}, but it is offline.")
         return
 
     pc_name = text
     if pc_name not in registry.all_names():
-        await update.message.reply_text("ПК с таким именем не найден. Проверьте имя.")
+        await update.message.reply_text("Computer not found. Check the name and try again.")
         return
 
     existing_user = active_sessions.get(pc_name, {}).get("tg_user_id")
     if existing_user and existing_user != user_id:
-        await update.message.reply_text("Этот ПК уже привязан к другому пользователю.")
+        await update.message.reply_text("This computer is already linked to another Telegram user.")
         return
 
     user_bindings[user_id] = pc_name
@@ -349,13 +364,13 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     })
     active_sessions[pc_name]["tg_user_id"] = user_id
 
-    await update.message.reply_text(f"Вы подключены к ПК {pc_name}.", reply_markup=USER_MENU)
-    await notify_admins(f"Юзер {user_id} подключился к ПК {pc_name}")
+    await update.message.reply_text(f"Connected to {pc_name}.", reply_markup=USER_MENU)
+    await notify_admins(f"User {user_id} connected to {pc_name}.")
 
 
 async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only")
+        await update.message.reply_text("Admin only")
         return
     args = " ".join(ctx.args)
     if not args:
@@ -367,7 +382,7 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     name, cmd = parts[0], parts[1]
     if name not in registry.clients and name not in registry.last_seen:
-        await update.message.reply_text(f"❌ Script '{name}' not found.")
+        await update.message.reply_text(f"Computer '{name}' was not found.")
         return
     ok = await registry.try_send(name, {
         "type": "command",
@@ -375,16 +390,16 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "reply_chat_id": update.effective_chat.id,
     })
     if ok:
-        await update.message.reply_text(f"✅ Sent to {name}")
+        await update.message.reply_text(f"Sent to {name}: {cmd}")
     else:
         await update.message.reply_text(
-            f"❌ '{name}' not connected. Last seen: {registry.last_seen.get(name, 'never')}"
+            f"{name} is offline. Last seen: {registry.last_seen.get(name, 'never')}"
         )
 
 
 async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only")
+        await update.message.reply_text("Admin only")
         return
     cmd = " ".join(ctx.args)
     if not cmd:
@@ -402,30 +417,30 @@ async def tg_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 sent.append(name)
             except Exception:
                 pass
-    await update.message.reply_text(f"📡 Broadcast: {', '.join(sent) or 'none'}")
+    await update.message.reply_text(f"Broadcast sent to: {', '.join(sent) or 'none'}")
 
 
 async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only")
+        await update.message.reply_text("Admin only")
         return
     names = registry.all_names()
     if not names:
-        await update.message.reply_text("No scripts connected yet.")
+        await update.message.reply_text("No computers have connected yet.")
         return
-    lines = ["📋 Scripts:\n"]
+    lines = ["Computers", ""]
     for name in sorted(names):
         ws = registry.clients.get(name)
-        icon = "🟢" if registry.is_alive(ws) else "🔴"
-        lines.append(f"{icon} {name}  ({registry.last_seen.get(name, 'never')})")
+        status = "Online" if registry.is_alive(ws) else "Offline"
+        lines.append(f"{name}\nStatus: {status}\nLast seen: {registry.last_seen.get(name, 'never')}\n")
     await update.message.reply_text("\n".join(lines))
 
 
 async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only")
+        await update.message.reply_text("Admin only")
         return
-    await update.message.reply_text(f"🌐 Panel: {PUBLIC_URL}/admin\nKey: {SECRET_KEY}")
+    await update.message.reply_text(f"Panel: {PUBLIC_URL}/admin\nKey: {SECRET_KEY}")
 
 
 async def h_keepalive_ping(request: web.Request) -> web.Response:
