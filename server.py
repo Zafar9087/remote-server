@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rc")
@@ -74,13 +74,26 @@ class ClientRegistry:
     def register(self, name: str, ws: web.WebSocketResponse) -> None:
         self.clients[name] = ws
         self.last_seen[name] = self._now()
+        active_sessions[name] = {
+            "pc_name": name,
+            "ws": ws,
+            "tg_user_id": active_sessions.get(name, {}).get("tg_user_id"),
+            "connected": True,
+            "connected_at": datetime.now().isoformat(timespec="seconds"),
+            "last_seen": self.last_seen[name],
+        }
 
     def disconnect(self, name: str, ws: web.WebSocketResponse) -> None:
         if self.clients.get(name) is ws:
             self.clients[name] = None
+        if active_sessions.get(name, {}).get("ws") is ws:
+            active_sessions[name]["ws"] = None
+            active_sessions[name]["connected"] = False
 
     def touch(self, name: str) -> None:
         self.last_seen[name] = self._now()
+        if name in active_sessions:
+            active_sessions[name]["last_seen"] = self.last_seen[name]
 
     def add_result(self, script: str, command: str, result: str) -> None:
         short = result[:200] if len(result) < 1000 else "[Screenshot / Binary]"
@@ -102,6 +115,27 @@ class ClientRegistry:
 
 registry = ClientRegistry()
 tg_app: Application | None = None
+
+USER_COMMANDS = {
+    "Выключить": "shutdown",
+    "Заблокировать": "lock",
+    "Сделать скриншот": "screenshot",
+    "Перезагрузка": "restart",
+}
+
+USER_MENU = ReplyKeyboardMarkup(
+    [
+        ["Выключить", "Заблокировать"],
+        ["Сделать скриншот", "Перезагрузка"],
+    ],
+    resize_keyboard=True,
+)
+
+# pc_name -> session metadata. The WebSocket itself is still owned by ClientRegistry.
+active_sessions: dict[str, dict] = {}
+
+# tg_user_id -> pc_name
+user_bindings: dict[int, str] = {}
 
 
 def _extract_image_bytes(text: str) -> bytes | None:
@@ -164,6 +198,16 @@ async def send_telegram(chat_id: int, text: str, client_name: str = "Script") ->
         log.error(f"Telegram send failed: {e}")
 
 
+async def notify_admins(text: str) -> None:
+    if not tg_app:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await tg_app.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            log.warning(f"Admin notify failed for {admin_id}: {e}")
+
+
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=25)
     await ws.prepare(request)
@@ -177,9 +221,13 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                 mtype = data.get("type", "")
 
                 if mtype == "register":
-                    name = data.get("name", "").strip()
+                    name = (data.get("name") or data.get("pc_name") or data.get("script_name") or "").strip()
                     if data.get("secret", "") != SECRET_KEY:
                         await ws.send_json({"type": "error", "msg": "Invalid secret key"})
+                        await ws.close()
+                        return ws
+                    if not name:
+                        await ws.send_json({"type": "error", "msg": "Empty client name"})
                         await ws.close()
                         return ws
                     client_name = name
@@ -215,6 +263,94 @@ async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         await update.message.reply_text("🖥 Remote Control")
+
+
+async def tg_start_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id in ADMIN_IDS:
+        await update.message.reply_text(
+            "Remote Control - Admin\n\n"
+            "/send <script> <cmd>\n"
+            "/broadcast <cmd>\n"
+            "/scripts\n"
+            "/sessions"
+        )
+        return
+
+    await update.message.reply_text(
+        "Введите уникальное имя ПК для подключения.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def tg_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+
+    if not active_sessions:
+        await update.message.reply_text("No active sessions.")
+        return
+
+    lines = ["Active sessions:"]
+    for name in sorted(active_sessions):
+        session = active_sessions[name]
+        connected = "online" if session.get("connected") else "offline"
+        user_id = session.get("tg_user_id") or "not bound"
+        lines.append(f"{name}: {connected}, user={user_id}, last={session.get('last_seen', 'never')}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    if user_id in ADMIN_IDS:
+        await update.message.reply_text("Admin commands: /send, /broadcast, /scripts, /sessions")
+        return
+
+    bound_pc = user_bindings.get(user_id)
+    if bound_pc:
+        if text not in USER_COMMANDS:
+            await update.message.reply_text("Команда недоступна.", reply_markup=USER_MENU)
+            return
+
+        cmd = USER_COMMANDS[text]
+        ok = await registry.try_send(bound_pc, {
+            "type": "command",
+            "command": cmd,
+            "reply_chat_id": update.effective_chat.id,
+        })
+        if ok:
+            await update.message.reply_text(f"Команда отправлена: {text}", reply_markup=USER_MENU)
+        else:
+            await update.message.reply_text(
+                f"ПК '{bound_pc}' сейчас не подключен. Админ уведомлен.",
+                reply_markup=USER_MENU,
+            )
+            await notify_admins(f"Проблема у юзера {user_id}: ПК {bound_pc} недоступен")
+        return
+
+    pc_name = text
+    if pc_name not in registry.all_names():
+        await update.message.reply_text("ПК с таким именем не найден. Проверьте имя.")
+        return
+
+    existing_user = active_sessions.get(pc_name, {}).get("tg_user_id")
+    if existing_user and existing_user != user_id:
+        await update.message.reply_text("Этот ПК уже привязан к другому пользователю.")
+        return
+
+    user_bindings[user_id] = pc_name
+    active_sessions.setdefault(pc_name, {
+        "pc_name": pc_name,
+        "ws": registry.clients.get(pc_name),
+        "connected": registry.is_alive(registry.clients.get(pc_name)),
+        "last_seen": registry.last_seen.get(pc_name, "never"),
+    })
+    active_sessions[pc_name]["tg_user_id"] = user_id
+
+    await update.message.reply_text(f"Вы подключены к ПК {pc_name}.", reply_markup=USER_MENU)
+    await notify_admins(f"Юзер {user_id} подключился к ПК {pc_name}")
 
 
 async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -379,10 +515,11 @@ async def main() -> None:
     if BOT_TOKEN:
         tg_app = Application.builder().token(BOT_TOKEN).build()
         for cmd, handler in [
-            ("start", tg_start), ("send", tg_send), ("broadcast", tg_broadcast),
-            ("scripts", tg_scripts), ("panel", tg_panel),
+            ("start", tg_start_v2), ("send", tg_send), ("broadcast", tg_broadcast),
+            ("scripts", tg_scripts), ("sessions", tg_sessions), ("panel", tg_panel),
         ]:
             tg_app.add_handler(CommandHandler(cmd, handler))
+        tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_text))
         await tg_app.initialize()
         await tg_app.start()
         asyncio.create_task(tg_app.updater.start_polling())
