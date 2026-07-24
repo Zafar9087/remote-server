@@ -22,7 +22,7 @@ log = logging.getLogger("rc")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
-SECRET_KEY = os.getenv("SECRET_KEY", "Zafarjon1224")
+SECRET_KEY = os.getenv("SECRET_KEY", "")  # НЕ хардкодить! Обязателен через переменную окружения
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://remote-server-mr8v.onrender.com")
 PORT = int(os.getenv("PORT", 8080))
 UPDATE_VERSION = int(os.getenv("UPDATE_VERSION", "1"))
@@ -139,6 +139,47 @@ active_sessions: dict[str, dict] = {}
 
 # tg_user_id -> pc_name
 user_bindings: dict[int, str] = {}
+
+
+def do_bind(user_id: int, pc_name: str) -> tuple[bool, str]:
+    """Admin-forced bind: link a Telegram user to a computer (add/replace)."""
+    if pc_name not in registry.all_names():
+        return False, f"Computer '{pc_name}' not found."
+
+    prev_pc = user_bindings.get(user_id)
+    if prev_pc and prev_pc != pc_name and active_sessions.get(prev_pc, {}).get("tg_user_id") == user_id:
+        active_sessions[prev_pc]["tg_user_id"] = None
+
+    user_bindings[user_id] = pc_name
+    active_sessions.setdefault(pc_name, {
+        "pc_name": pc_name,
+        "ws": registry.clients.get(pc_name),
+        "connected": registry.is_alive(registry.clients.get(pc_name)),
+        "last_seen": registry.last_seen.get(pc_name, "never"),
+    })
+    active_sessions[pc_name]["tg_user_id"] = user_id
+    return True, f"Bound user {user_id} to {pc_name}."
+
+
+def do_unbind(target: str) -> tuple[bool, str]:
+    """Admin-forced unbind. `target` can be a Telegram user id or a computer name."""
+    target = target.strip()
+    if target.isdigit():
+        uid = int(target)
+        pc = user_bindings.pop(uid, None)
+        if pc and active_sessions.get(pc, {}).get("tg_user_id") == uid:
+            active_sessions[pc]["tg_user_id"] = None
+        if pc:
+            return True, f"Unbound user {uid} from {pc}."
+        return False, f"User {uid} was not bound to anything."
+    else:
+        pc = target
+        uid = active_sessions.get(pc, {}).get("tg_user_id")
+        if uid:
+            user_bindings.pop(uid, None)
+            active_sessions[pc]["tg_user_id"] = None
+            return True, f"Unbound {pc} from user {uid}."
+        return False, f"{pc} had no user bound."
 
 
 def _extract_image_bytes(text: str) -> bytes | None:
@@ -258,31 +299,21 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-async def tg_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id in ADMIN_IDS:
-        await update.message.reply_text(
-            "Remote Control Admin\n\n"
-            "/scripts - show computers\n"
-            "/sessions - show user links\n"
-            "/send <computer> <command>\n"
-            "/broadcast <command>\n"
-            "/panel - admin panel details"
-        )
-    else:
-        await update.message.reply_text("Remote Control")
-
-
 async def tg_start_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id in ADMIN_IDS:
         await update.message.reply_text(
             "Remote Control Admin\n\n"
-            "Use /scripts to see connected computers.\n"
+            "Use /scripts to see connected computers (grouped online/offline).\n"
+            "Use /offline or /online to see just one group.\n"
             "Use /send <computer> <command> to run one command.\n"
             "Use /broadcast <command> to run a command on every online computer.\n\n"
-            "Commands:\n"
-            "/scripts\n"
+            "Users:\n"
+            "/users — list Telegram users bound to computers\n"
+            "/bind <telegram_user_id> <computer> — link a user to a computer\n"
+            "/unbind <telegram_user_id | computer> — remove a link\n\n"
+            "Other:\n"
             "/sessions\n"
-            "/panel"
+            "/panel — web admin panel link"
         )
         return
 
@@ -315,12 +346,85 @@ async def tg_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def tg_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    if not user_bindings:
+        await update.message.reply_text("No users bound yet. Use /bind <user_id> <computer>.")
+        return
+    lines = ["Bound users", ""]
+    for uid, pc in sorted(user_bindings.items()):
+        status = "Online" if registry.is_alive(registry.clients.get(pc)) else "Offline"
+        lines.append(f"{uid} → {pc} ({status})")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def tg_bind(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    if len(ctx.args) < 2:
+        await update.message.reply_text("Usage: /bind <telegram_user_id> <computer>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("telegram_user_id must be a number.")
+        return
+    ok, msg = do_bind(uid, ctx.args[1])
+    await update.message.reply_text(msg)
+
+
+async def tg_unbind(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /unbind <telegram_user_id | computer>")
+        return
+    ok, msg = do_unbind(ctx.args[0])
+    await update.message.reply_text(msg)
+
+
+async def tg_offline(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    online = set(registry.online_names())
+    offline = sorted(n for n in registry.all_names() if n not in online)
+    if not offline:
+        await update.message.reply_text("All computers are online.")
+        return
+    lines = [f"Offline ({len(offline)})", ""]
+    for n in offline:
+        lines.append(f"{n} — last seen {registry.last_seen.get(n, 'never')}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def tg_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    online = sorted(registry.online_names())
+    if not online:
+        await update.message.reply_text("No computers online right now.")
+        return
+    lines = [f"Online ({len(online)})", ""]
+    for n in online:
+        uid = active_sessions.get(n, {}).get("tg_user_id")
+        lines.append(f"{n}" + (f" (user {uid})" if uid else ""))
+    await update.message.reply_text("\n".join(lines))
+
+
 async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
 
     if user_id in ADMIN_IDS:
-        await update.message.reply_text("Admin commands: /scripts, /sessions, /send, /broadcast, /panel")
+        await update.message.reply_text(
+            "Admin commands: /scripts, /online, /offline, /sessions, /users, /bind, /unbind, /send, /broadcast, /panel"
+        )
         return
 
     bound_pc = user_bindings.get(user_id)
@@ -428,11 +532,21 @@ async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not names:
         await update.message.reply_text("No computers have connected yet.")
         return
-    lines = ["Computers", ""]
-    for name in sorted(names):
-        ws = registry.clients.get(name)
-        status = "Online" if registry.is_alive(ws) else "Offline"
-        lines.append(f"{name}\nStatus: {status}\nLast seen: {registry.last_seen.get(name, 'never')}\n")
+
+    online = sorted(registry.online_names())
+    offline = sorted(n for n in names if n not in online)
+
+    lines = [f"Computers — {len(online)} online / {len(offline)} offline", ""]
+    if online:
+        lines.append("Online:")
+        for n in online:
+            uid = active_sessions.get(n, {}).get("tg_user_id")
+            lines.append(f"  {n}" + (f" (user {uid})" if uid else ""))
+        lines.append("")
+    if offline:
+        lines.append("Offline:")
+        for n in offline:
+            lines.append(f"  {n} — last seen {registry.last_seen.get(n, 'never')}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -440,7 +554,7 @@ async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Admin only")
         return
-    await update.message.reply_text(f"Panel: {PUBLIC_URL}/admin\nKey: {SECRET_KEY}")
+    await update.message.reply_text(f"Panel: {PUBLIC_URL}/admin?key={SECRET_KEY}")
 
 
 async def h_keepalive_ping(request: web.Request) -> web.Response:
@@ -456,8 +570,12 @@ async def h_status(request: web.Request) -> web.Response:
     })
 
 
+def _check_admin(request: web.Request) -> bool:
+    return request.headers.get("X-Admin-Key", "") == SECRET_KEY
+
+
 async def h_scripts(request: web.Request) -> web.Response:
-    if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
+    if not _check_admin(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     scripts = sorted([
         {
@@ -470,8 +588,49 @@ async def h_scripts(request: web.Request) -> web.Response:
     return web.json_response({"scripts": scripts, "history": registry.history[-30:]})
 
 
+async def h_users(request: web.Request) -> web.Response:
+    if not _check_admin(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    users = [
+        {
+            "user_id": uid,
+            "pc_name": pc,
+            "connected": registry.is_alive(registry.clients.get(pc)),
+        }
+        for uid, pc in sorted(user_bindings.items())
+    ]
+    return web.json_response({"users": users})
+
+
+async def h_bind(request: web.Request) -> web.Response:
+    if not _check_admin(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        uid = int(data.get("user_id"))
+        pc_name = str(data.get("pc_name", "")).strip()
+    except Exception:
+        return web.json_response({"error": "Bad request — need user_id (int) and pc_name"}, status=400)
+    ok, msg = do_bind(uid, pc_name)
+    return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 400)
+
+
+async def h_unbind(request: web.Request) -> web.Response:
+    if not _check_admin(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+        target = str(data.get("target", "")).strip()
+    except Exception:
+        return web.json_response({"error": "Bad request"}, status=400)
+    if not target:
+        return web.json_response({"error": "target required"}, status=400)
+    ok, msg = do_unbind(target)
+    return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 400)
+
+
 async def h_send(request: web.Request) -> web.Response:
-    if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
+    if not _check_admin(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         data = await request.json()
@@ -490,7 +649,7 @@ async def h_send(request: web.Request) -> web.Response:
 
 
 async def h_broadcast(request: web.Request) -> web.Response:
-    if request.headers.get("X-Admin-Key", "") != SECRET_KEY:
+    if not _check_admin(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         data = await request.json()
@@ -525,13 +684,110 @@ async def h_update(request: web.Request) -> web.Response:
     return web.json_response({"error": "No update file"}, status=404)
 
 
+ADMIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Remote Control Admin</title>
+<style>
+ body{background:#0d1117;color:#e6edf3;font-family:"Segoe UI",sans-serif;padding:24px;max-width:900px;margin:auto}
+ h1{font-size:20px} h2{font-size:14px;color:#8b949e;margin-top:26px;text-transform:uppercase;letter-spacing:.04em}
+ #summary{color:#8b949e;margin-bottom:4px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-bottom:6px;font-size:14px}
+ .online{border-left:3px solid #3fb950} .offline{border-left:3px solid #f85149}
+ input{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:7px 10px;margin-right:6px}
+ button{background:#161b22;color:#58a6ff;border:1px solid #30363d;border-radius:6px;padding:7px 14px;cursor:pointer}
+ button:hover{border-color:#58a6ff}
+ .row{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+ small{color:#8b949e}
+ pre{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;font-size:12px;white-space:pre-wrap}
+</style></head>
+<body>
+<h1>Remote Control — Admin</h1>
+<div id="summary"></div>
+
+<h2>Online</h2><div id="online"></div>
+<h2>Offline</h2><div id="offline"></div>
+
+<h2>Users</h2><div id="users"></div>
+<div class="row">
+  <input id="bind-uid" placeholder="Telegram user id">
+  <input id="bind-pc" placeholder="Computer name">
+  <button onclick="doBind()">Bind</button>
+  <button onclick="doUnbind()">Unbind</button>
+</div>
+
+<h2>Send command</h2>
+<div class="row">
+  <input id="cmd-pc" placeholder="Computer name">
+  <input id="cmd-text" placeholder="command" style="width:260px">
+  <button onclick="doSend()">Send</button>
+</div>
+<pre id="log">ready</pre>
+
+<script>
+const KEY = new URLSearchParams(location.search).get("key") || "";
+const H = {"X-Admin-Key": KEY, "Content-Type": "application/json"};
+
+async function refresh() {
+  const r = await fetch("/api/scripts", {headers: H});
+  const d = await r.json();
+  if (d.error) { log(d); return; }
+  const online = d.scripts.filter(s => s.connected);
+  const offline = d.scripts.filter(s => !s.connected);
+  document.getElementById("summary").innerText = online.length + " online / " + offline.length + " offline";
+  document.getElementById("online").innerHTML = online.map(s =>
+    '<div class="card online">' + s.name + '</div>').join("") || "<small>none</small>";
+  document.getElementById("offline").innerHTML = offline.map(s =>
+    '<div class="card offline">' + s.name + ' — last seen ' + s.last_seen + '</div>').join("") || "<small>none</small>";
+
+  const ur = await fetch("/api/users", {headers: H});
+  const ud = await ur.json();
+  document.getElementById("users").innerHTML = (ud.users || []).map(u =>
+    '<div class="card">user ' + u.user_id + ' &rarr; ' + u.pc_name + ' (' + (u.connected ? "online" : "offline") + ')</div>'
+  ).join("") || "<small>none</small>";
+}
+
+async function doBind() {
+  const uid = document.getElementById("bind-uid").value.trim();
+  const pc = document.getElementById("bind-pc").value.trim();
+  const r = await fetch("/api/bind", {method:"POST", headers:H, body: JSON.stringify({user_id: uid, pc_name: pc})});
+  log(await r.json()); refresh();
+}
+async function doUnbind() {
+  const pc = document.getElementById("bind-pc").value.trim();
+  const uid = document.getElementById("bind-uid").value.trim();
+  const r = await fetch("/api/unbind", {method:"POST", headers:H, body: JSON.stringify({target: pc || uid})});
+  log(await r.json()); refresh();
+}
+async function doSend() {
+  const pc = document.getElementById("cmd-pc").value.trim();
+  const cmd = document.getElementById("cmd-text").value.trim();
+  const r = await fetch("/api/send", {method:"POST", headers:H, body: JSON.stringify({script: pc, command: cmd})});
+  log(await r.json());
+}
+function log(x){ document.getElementById("log").innerText = JSON.stringify(x, null, 2); }
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body></html>"""
+
+
+async def h_admin(request: web.Request) -> web.Response:
+    return web.Response(text=ADMIN_HTML, content_type="text/html")
+
+
 async def main() -> None:
+    if not SECRET_KEY:
+        log.error("FATAL: SECRET_KEY env var is empty — refusing to start (would accept any client).")
+        raise SystemExit(1)
+
     global tg_app
     if BOT_TOKEN:
         tg_app = Application.builder().token(BOT_TOKEN).build()
         for cmd, handler in [
             ("start", tg_start_v2), ("send", tg_send), ("broadcast", tg_broadcast),
-            ("scripts", tg_scripts), ("sessions", tg_sessions), ("panel", tg_panel),
+            ("scripts", tg_scripts), ("online", tg_online), ("offline", tg_offline),
+            ("sessions", tg_sessions), ("users", tg_users), ("bind", tg_bind),
+            ("unbind", tg_unbind), ("panel", tg_panel),
         ]:
             tg_app.add_handler(CommandHandler(cmd, handler))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_text))
@@ -545,8 +801,12 @@ async def main() -> None:
     app = web.Application()
     app.router.add_get("/", h_keepalive_ping)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/admin", h_admin)
     app.router.add_get("/api/status", h_status)
     app.router.add_get("/api/scripts", h_scripts)
+    app.router.add_get("/api/users", h_users)
+    app.router.add_post("/api/bind", h_bind)
+    app.router.add_post("/api/unbind", h_unbind)
     app.router.add_post("/api/send", h_send)
     app.router.add_post("/api/broadcast", h_broadcast)
     app.router.add_get("/version", h_version)
