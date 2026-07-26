@@ -131,9 +131,9 @@ USER_COMMANDS = {
     "⚡ Power off":   "shutdown",
 }
 
-def user_inline_keyboard(pc_name: str) -> InlineKeyboardMarkup:
-    """Inline кнопки для пользователя — красиво и удобно."""
-    return InlineKeyboardMarkup([
+def user_inline_keyboard(pc_name: str, plugin_buttons: list = None) -> InlineKeyboardMarkup:
+    """Inline кнопки для юзера — базовые + кнопки от плагинов."""
+    rows = [
         [
             InlineKeyboardButton("📸 Screenshot",  callback_data=f"cmd:{pc_name}:screenshot"),
             InlineKeyboardButton("🔒 Lock",        callback_data=f"cmd:{pc_name}:lock"),
@@ -146,28 +146,30 @@ def user_inline_keyboard(pc_name: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 Restart",     callback_data=f"cmd:{pc_name}:restart"),
             InlineKeyboardButton("⚡ Power off",   callback_data=f"cmd:{pc_name}:shutdown"),
         ],
-        [
-            InlineKeyboardButton("🖥 Status",      callback_data=f"cmd:{pc_name}:status"),
-            InlineKeyboardButton("📋 Processes",   callback_data=f"cmd:{pc_name}:processes"),
-        ],
-    ])
+    ]
+    # Добавляем кнопки от плагинов
+    if plugin_buttons:
+        plugin_row = []
+        for btn in plugin_buttons:
+            plugin_row.append(InlineKeyboardButton(
+                btn["label"], callback_data=f"cmd:{pc_name}:{btn['cmd']}"
+            ))
+            if len(plugin_row) == 2:
+                rows.append(plugin_row)
+                plugin_row = []
+        if plugin_row:
+            rows.append(plugin_row)
+    return InlineKeyboardMarkup(rows)
 
-def admin_pc_keyboard(pc_name: str) -> InlineKeyboardMarkup:
-    """Inline кнопки для быстрых действий админа по конкретному ПК."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📸 Screenshot", callback_data=f"cmd:{pc_name}:screenshot"),
-            InlineKeyboardButton("📊 Status",     callback_data=f"cmd:{pc_name}:status"),
-        ],
-        [
-            InlineKeyboardButton("🔒 Lock",       callback_data=f"cmd:{pc_name}:lock"),
-            InlineKeyboardButton("🔄 Restart",    callback_data=f"cmd:{pc_name}:restart"),
-        ],
-        [
-            InlineKeyboardButton("🔌 Plugins",    callback_data=f"cmd:{pc_name}:plugins_list"),
-            InlineKeyboardButton("⚡ Shutdown",   callback_data=f"cmd:{pc_name}:shutdown"),
-        ],
-    ])
+
+def get_plugin_buttons(pc_name: str) -> list:
+    """Получить кнопки плагинов для конкретного ПК из active_sessions."""
+    plugins = active_sessions.get(pc_name, {}).get("plugins", [])
+    buttons = []
+    for pl in plugins:
+        if pl.get("show_button") and pl.get("button_label") and pl.get("button_cmd"):
+            buttons.append({"label": pl["button_label"], "cmd": pl["button_cmd"]})
+    return buttons
 
 # pc_name -> session metadata. The WebSocket itself is still owned by ClientRegistry.
 active_sessions: dict[str, dict] = {}
@@ -311,7 +313,6 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         return ws
                     client_name = name
                     registry.register(name, ws)
-                    # Сохранить плагины клиента
                     plugins = data.get("plugins", [])
                     if name in active_sessions:
                         active_sessions[name]["plugins"] = plugins
@@ -339,45 +340,30 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
 
 async def tg_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатия inline кнопок (cmd:<pc>:<command>)."""
     query = update.callback_query
     await query.answer()
-
     user_id = query.from_user.id
     data = query.data or ""
-
     if not data.startswith("cmd:"):
         return
-
     _, pc_name, cmd = data.split(":", 2)
-
-    # Проверка прав — только привязанный юзер или админ
     if user_id not in ADMIN_IDS:
-        bound = user_bindings.get(user_id)
-        if bound != pc_name:
-            await query.answer("You don't have access to this computer.", show_alert=True)
+        if user_bindings.get(user_id) != pc_name:
+            await query.answer("❌ No access.", show_alert=True)
             return
-
     ok = await registry.try_send(pc_name, {
         "type": "command",
         "command": cmd,
         "reply_chat_id": query.message.chat_id,
     })
-
-    status = "✅ Sent" if ok else "❌ Offline"
-    try:
-        await query.edit_message_reply_markup(
-            reply_markup=user_inline_keyboard(pc_name)
-            if user_id not in ADMIN_IDS else admin_pc_keyboard(pc_name)
-        )
-    except Exception:
-        pass
-
     if not ok:
-        await ctx.bot.send_message(
-            query.message.chat_id,
-            f"❌ {pc_name} is offline right now."
-        )
+        await ctx.bot.send_message(query.message.chat_id, f"❌ *{pc_name}* is offline.", parse_mode="Markdown")
+    else:
+        try:
+            plugin_btns = get_plugin_buttons(pc_name)
+            await query.edit_message_reply_markup(reply_markup=user_inline_keyboard(pc_name, plugin_btns))
+        except Exception:
+            pass
 
 
 async def tg_start_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,10 +515,11 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Юзер уже привязан — показываем inline кнопки ещё раз
         is_online = registry.is_alive(registry.clients.get(bound_pc))
         status = "🟢 Online" if is_online else "🔴 Offline"
+        plugin_btns = get_plugin_buttons(bound_pc)
         await update.message.reply_text(
             f"🖥 *{bound_pc}* — {status}\nChoose an action:",
             parse_mode="Markdown",
-            reply_markup=user_inline_keyboard(bound_pc),
+            reply_markup=user_inline_keyboard(bound_pc, plugin_btns),
         )
         return
 
@@ -562,10 +549,11 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     is_online = registry.is_alive(registry.clients.get(pc_name))
     status = "🟢 Online" if is_online else "🔴 Offline"
+    plugin_btns = get_plugin_buttons(pc_name)
     await update.message.reply_text(
         f"✅ Connected to *{pc_name}*\n{status}",
         parse_mode="Markdown",
-        reply_markup=user_inline_keyboard(pc_name),
+        reply_markup=user_inline_keyboard(pc_name, plugin_btns),
     )
     await notify_admins(f"👤 User {user_id} connected to {pc_name}.")
 
@@ -576,15 +564,32 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = " ".join(ctx.args)
     if not args:
-        await update.message.reply_text("Usage: /send <script> <command>")
+        await update.message.reply_text(
+            "📤 *Send command*\n\n"
+            "Usage: `/send <pc> <command>`\n"
+            "Plugin install: `/send <pc> plugin <url>`\n"
+            "Example: `/send my\\-pc screenshot`",
+            parse_mode="Markdown"
+        )
         return
-    parts = args.split(None, 1)
+    parts = args.split(None, 2)
     if len(parts) < 2:
-        await update.message.reply_text("Usage: /send <script> <command>")
+        await update.message.reply_text("Usage: `/send <pc> <command>`", parse_mode="Markdown")
         return
-    name, cmd = parts[0], parts[1]
+
+    name = parts[0]
+    # Алиас: /send pc plugin <url>  →  plugin_install <url>
+    if parts[1].lower() == "plugin":
+        url = parts[2] if len(parts) > 2 else ""
+        if not url:
+            await update.message.reply_text("Usage: `/send <pc> plugin <url>`", parse_mode="Markdown")
+            return
+        cmd = f"plugin_install {url}"
+    else:
+        cmd = " ".join(parts[1:])
+
     if name not in registry.clients and name not in registry.last_seen:
-        await update.message.reply_text(f"Computer '{name}' was not found.")
+        await update.message.reply_text(f"❌ Computer `{name}` not found.", parse_mode="Markdown")
         return
     ok = await registry.try_send(name, {
         "type": "command",
@@ -592,10 +597,11 @@ async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "reply_chat_id": update.effective_chat.id,
     })
     if ok:
-        await update.message.reply_text(f"Sent to {name}: {cmd}")
+        await update.message.reply_text(f"✅ Sent to *{name}*:\n`{cmd}`", parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            f"{name} is offline. Last seen: {registry.last_seen.get(name, 'never')}"
+            f"❌ *{name}* is offline\n_Last seen: {registry.last_seen.get(name, 'never')}_",
+            parse_mode="Markdown"
         )
 
 
@@ -628,54 +634,69 @@ async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     names = registry.all_names()
     if not names:
-        await update.message.reply_text("No computers have connected yet.")
+        await update.message.reply_text("📭 No computers have connected yet.")
         return
 
     online  = sorted(registry.online_names())
     offline = sorted(n for n in names if n not in online)
 
-    header = f"🖥 *Computers* — {len(online)} online / {len(offline)} offline"
-    await update.message.reply_text(header, parse_mode="Markdown")
+    lines = [f"🖥 *Computers* — `{len(online)}` online / `{len(offline)}` offline\n"]
 
-    # Для каждого онлайн ПК — отдельное сообщение с inline кнопками
-    for n in online:
-        uid = active_sessions.get(n, {}).get("tg_user_id")
-        user_line = f"👤 User {uid}" if uid else "👤 No user"
-        await update.message.reply_text(
-            f"🟢 *{n}*\n{user_line}",
-            parse_mode="Markdown",
-            reply_markup=admin_pc_keyboard(n),
-        )
+    if online:
+        lines.append("*🟢 Online:*")
+        for n in online:
+            uid = active_sessions.get(n, {}).get("tg_user_id")
+            plugins = active_sessions.get(n, {}).get("plugins", [])
+            user_line = f"  👤 User `{uid}`" if uid else "  👤 _No user_"
+            plugin_line = f"  🔌 `{len(plugins)}` plugin(s)" if plugins else ""
+            lines.append(f"  • *{n}*\n{user_line}" + (f"\n{plugin_line}" if plugin_line else ""))
+        lines.append("")
 
-    # Офлайн — просто списком
     if offline:
-        lines = ["🔴 *Offline:*"] + [f"  • {n} — last seen {registry.last_seen.get(n,'never')}" for n in offline]
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append("*🔴 Offline:*")
+        for n in offline:
+            last = registry.last_seen.get(n, "never")
+            lines.append(f"  • *{n}* — last seen `{last}`")
+
+    lines.append(f"\n_Use /send <pc> <command> to run a command_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def tg_plugins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Admin only")
         return
-    lines = ["Plugins by computer", ""]
-    found_any = False
+
+    has_any = False
+    lines = ["🔌 *Installed Plugins*\n"]
     for name in sorted(active_sessions):
         plugins = active_sessions[name].get("plugins", [])
         if not plugins:
             continue
-        found_any = True
-        status = "Online" if registry.is_alive(registry.clients.get(name)) else "Offline"
-        lines.append(f"{name} ({status}):")
+        has_any = True
+        status = "🟢" if registry.is_alive(registry.clients.get(name)) else "🔴"
+        lines.append(f"{status} *{name}*")
         for pl in plugins:
-            lines.append(f"  • {pl['name']} v{pl.get('version','?')} — {pl.get('description','')}")
+            btn = "🔘" if pl.get("show_button") else "⚪️"
+            lines.append(f"  {btn} *{pl['name']}* `v{pl.get('version','?')}`")
+            lines.append(f"  _{pl.get('description','')}_")
             cmds = pl.get("commands", [])
             if cmds:
-                lines.append(f"    Commands: {', '.join(cmds)}")
+                lines.append(f"  Commands: `{'` · `'.join(cmds)}`")
         lines.append("")
-    if not found_any:
-        await update.message.reply_text("No clients have plugins installed.")
+
+    if not has_any:
+        await update.message.reply_text(
+            "🔌 *No plugins installed*\n\n"
+            "_To install a plugin on a PC:_\n"
+            "`/send <pc> plugin_install <url>`",
+            parse_mode="Markdown"
+        )
         return
-    await update.message.reply_text("\n".join(lines))
+
+    lines.append("_🔘 = shows button for users  ⚪️ = hidden_")
+    lines.append("_Install: /send <pc> plugin\\_install <url>_")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
