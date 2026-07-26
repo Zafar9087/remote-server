@@ -14,8 +14,14 @@ from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
+    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo,
+)
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes,
+    MessageHandler, CallbackQueryHandler, filters,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rc")
@@ -117,22 +123,51 @@ registry = ClientRegistry()
 tg_app: Application | None = None
 
 USER_COMMANDS = {
-    "Power off": "shutdown",
-    "Lock screen": "lock",
-    "Screenshot": "screenshot",
-    "Restart": "restart",
-    "System info": "sysinfo",
-    "Battery": "battery",
+    "📸 Screenshot":  "screenshot",
+    "🔒 Lock screen": "lock",
+    "📊 System info": "sysinfo",
+    "🔋 Battery":     "battery",
+    "🔄 Restart":     "restart",
+    "⚡ Power off":   "shutdown",
 }
 
-USER_MENU = ReplyKeyboardMarkup(
-    [
-        ["Screenshot", "Lock screen"],
-        ["System info", "Battery"],
-        ["Restart", "Power off"],
-    ],
-    resize_keyboard=True,
-)
+def user_inline_keyboard(pc_name: str) -> InlineKeyboardMarkup:
+    """Inline кнопки для пользователя — красиво и удобно."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📸 Screenshot",  callback_data=f"cmd:{pc_name}:screenshot"),
+            InlineKeyboardButton("🔒 Lock",        callback_data=f"cmd:{pc_name}:lock"),
+        ],
+        [
+            InlineKeyboardButton("📊 Sysinfo",     callback_data=f"cmd:{pc_name}:sysinfo"),
+            InlineKeyboardButton("🔋 Battery",     callback_data=f"cmd:{pc_name}:battery"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Restart",     callback_data=f"cmd:{pc_name}:restart"),
+            InlineKeyboardButton("⚡ Power off",   callback_data=f"cmd:{pc_name}:shutdown"),
+        ],
+        [
+            InlineKeyboardButton("🖥 Status",      callback_data=f"cmd:{pc_name}:status"),
+            InlineKeyboardButton("📋 Processes",   callback_data=f"cmd:{pc_name}:processes"),
+        ],
+    ])
+
+def admin_pc_keyboard(pc_name: str) -> InlineKeyboardMarkup:
+    """Inline кнопки для быстрых действий админа по конкретному ПК."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📸 Screenshot", callback_data=f"cmd:{pc_name}:screenshot"),
+            InlineKeyboardButton("📊 Status",     callback_data=f"cmd:{pc_name}:status"),
+        ],
+        [
+            InlineKeyboardButton("🔒 Lock",       callback_data=f"cmd:{pc_name}:lock"),
+            InlineKeyboardButton("🔄 Restart",    callback_data=f"cmd:{pc_name}:restart"),
+        ],
+        [
+            InlineKeyboardButton("🔌 Plugins",    callback_data=f"cmd:{pc_name}:plugins_list"),
+            InlineKeyboardButton("⚡ Shutdown",   callback_data=f"cmd:{pc_name}:shutdown"),
+        ],
+    ])
 
 # pc_name -> session metadata. The WebSocket itself is still owned by ClientRegistry.
 active_sessions: dict[str, dict] = {}
@@ -276,7 +311,11 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
                         return ws
                     client_name = name
                     registry.register(name, ws)
-                    log.info(f"+ {name} registered")
+                    # Сохранить плагины клиента
+                    plugins = data.get("plugins", [])
+                    if name in active_sessions:
+                        active_sessions[name]["plugins"] = plugins
+                    log.info(f"+ {name} registered ({len(plugins)} plugins)")
                     await ws.send_json({"type": "ok"})
 
                 elif mtype == "result":
@@ -299,26 +338,77 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def tg_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатия inline кнопок (cmd:<pc>:<command>)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data or ""
+
+    if not data.startswith("cmd:"):
+        return
+
+    _, pc_name, cmd = data.split(":", 2)
+
+    # Проверка прав — только привязанный юзер или админ
+    if user_id not in ADMIN_IDS:
+        bound = user_bindings.get(user_id)
+        if bound != pc_name:
+            await query.answer("You don't have access to this computer.", show_alert=True)
+            return
+
+    ok = await registry.try_send(pc_name, {
+        "type": "command",
+        "command": cmd,
+        "reply_chat_id": query.message.chat_id,
+    })
+
+    status = "✅ Sent" if ok else "❌ Offline"
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=user_inline_keyboard(pc_name)
+            if user_id not in ADMIN_IDS else admin_pc_keyboard(pc_name)
+        )
+    except Exception:
+        pass
+
+    if not ok:
+        await ctx.bot.send_message(
+            query.message.chat_id,
+            f"❌ {pc_name} is offline right now."
+        )
+
+
 async def tg_start_v2(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id in ADMIN_IDS:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🖥 Open Admin Panel",
+                web_app=WebAppInfo(url=f"{PUBLIC_URL}/admin?key={SECRET_KEY}")
+            )
+        ]])
         await update.message.reply_text(
-            "Remote Control Admin\n\n"
-            "Use /scripts to see connected computers (grouped online/offline).\n"
-            "Use /offline or /online to see just one group.\n"
-            "Use /send <computer> <command> to run one command.\n"
-            "Use /broadcast <command> to run a command on every online computer.\n\n"
-            "Users:\n"
-            "/users — list Telegram users bound to computers\n"
-            "/bind <telegram_user_id> <computer> — link a user to a computer\n"
-            "/unbind <telegram_user_id | computer> — remove a link\n\n"
-            "Other:\n"
-            "/sessions\n"
-            "/panel — web admin panel link"
+            "🔧 *Remote Control Admin*\n\n"
+            "Commands:\n"
+            "/scripts — computers online/offline\n"
+            "/online · /offline — filter by status\n"
+            "/users — bound Telegram users\n"
+            "/bind <user\\_id> <pc> — link user to PC\n"
+            "/unbind <user\\_id|pc> — remove link\n"
+            "/plugins — installed plugins\n"
+            "/send <pc> <cmd> — run command\n"
+            "/broadcast <cmd> — send to all online\n"
+            "/panel — admin panel link",
+            parse_mode="Markdown",
+            reply_markup=kb,
         )
         return
 
     await update.message.reply_text(
-        "Send your computer name to connect. Ask the admin if you do not know it.",
+        "👋 Welcome to *Remote Control*\n\n"
+        "Send your computer name to connect.",
+        parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -422,41 +512,43 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
 
     if user_id in ADMIN_IDS:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🖥 Open Admin Panel",
+                web_app=WebAppInfo(url=f"{PUBLIC_URL}/admin?key={SECRET_KEY}")
+            )
+        ]])
         await update.message.reply_text(
-            "Admin commands: /scripts, /online, /offline, /sessions, /users, /bind, /unbind, /send, /broadcast, /panel"
+            "Use /start to see all commands.",
+            reply_markup=kb,
         )
         return
 
     bound_pc = user_bindings.get(user_id)
     if bound_pc:
-        if text not in USER_COMMANDS:
-            await update.message.reply_text("Choose a command from the menu.", reply_markup=USER_MENU)
-            return
-
-        cmd = USER_COMMANDS[text]
-        ok = await registry.try_send(bound_pc, {
-            "type": "command",
-            "command": cmd,
-            "reply_chat_id": update.effective_chat.id,
-        })
-        if ok:
-            await update.message.reply_text(f"Sent: {text}", reply_markup=USER_MENU)
-        else:
-            await update.message.reply_text(
-                f"{bound_pc} is offline right now. The admin was notified.",
-                reply_markup=USER_MENU,
-            )
-            await notify_admins(f"User {user_id} tried to use {bound_pc}, but it is offline.")
+        # Юзер уже привязан — показываем inline кнопки ещё раз
+        is_online = registry.is_alive(registry.clients.get(bound_pc))
+        status = "🟢 Online" if is_online else "🔴 Offline"
+        await update.message.reply_text(
+            f"🖥 *{bound_pc}* — {status}\nChoose an action:",
+            parse_mode="Markdown",
+            reply_markup=user_inline_keyboard(bound_pc),
+        )
         return
 
+    # Юзер не привязан — пробуем привязать по имени ПК
     pc_name = text
     if pc_name not in registry.all_names():
-        await update.message.reply_text("Computer not found. Check the name and try again.")
+        await update.message.reply_text(
+            "❌ Computer not found.\nCheck the name and try again."
+        )
         return
 
     existing_user = active_sessions.get(pc_name, {}).get("tg_user_id")
     if existing_user and existing_user != user_id:
-        await update.message.reply_text("This computer is already linked to another Telegram user.")
+        await update.message.reply_text(
+            "⚠️ This computer is already linked to another user."
+        )
         return
 
     user_bindings[user_id] = pc_name
@@ -468,8 +560,14 @@ async def tg_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     })
     active_sessions[pc_name]["tg_user_id"] = user_id
 
-    await update.message.reply_text(f"Connected to {pc_name}.", reply_markup=USER_MENU)
-    await notify_admins(f"User {user_id} connected to {pc_name}.")
+    is_online = registry.is_alive(registry.clients.get(pc_name))
+    status = "🟢 Online" if is_online else "🔴 Offline"
+    await update.message.reply_text(
+        f"✅ Connected to *{pc_name}*\n{status}",
+        parse_mode="Markdown",
+        reply_markup=user_inline_keyboard(pc_name),
+    )
+    await notify_admins(f"👤 User {user_id} connected to {pc_name}.")
 
 
 async def tg_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -533,20 +631,50 @@ async def tg_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No computers have connected yet.")
         return
 
-    online = sorted(registry.online_names())
+    online  = sorted(registry.online_names())
     offline = sorted(n for n in names if n not in online)
 
-    lines = [f"Computers — {len(online)} online / {len(offline)} offline", ""]
-    if online:
-        lines.append("Online:")
-        for n in online:
-            uid = active_sessions.get(n, {}).get("tg_user_id")
-            lines.append(f"  {n}" + (f" (user {uid})" if uid else ""))
-        lines.append("")
+    header = f"🖥 *Computers* — {len(online)} online / {len(offline)} offline"
+    await update.message.reply_text(header, parse_mode="Markdown")
+
+    # Для каждого онлайн ПК — отдельное сообщение с inline кнопками
+    for n in online:
+        uid = active_sessions.get(n, {}).get("tg_user_id")
+        user_line = f"👤 User {uid}" if uid else "👤 No user"
+        await update.message.reply_text(
+            f"🟢 *{n}*\n{user_line}",
+            parse_mode="Markdown",
+            reply_markup=admin_pc_keyboard(n),
+        )
+
+    # Офлайн — просто списком
     if offline:
-        lines.append("Offline:")
-        for n in offline:
-            lines.append(f"  {n} — last seen {registry.last_seen.get(n, 'never')}")
+        lines = ["🔴 *Offline:*"] + [f"  • {n} — last seen {registry.last_seen.get(n,'never')}" for n in offline]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def tg_plugins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Admin only")
+        return
+    lines = ["Plugins by computer", ""]
+    found_any = False
+    for name in sorted(active_sessions):
+        plugins = active_sessions[name].get("plugins", [])
+        if not plugins:
+            continue
+        found_any = True
+        status = "Online" if registry.is_alive(registry.clients.get(name)) else "Offline"
+        lines.append(f"{name} ({status}):")
+        for pl in plugins:
+            lines.append(f"  • {pl['name']} v{pl.get('version','?')} — {pl.get('description','')}")
+            cmds = pl.get("commands", [])
+            if cmds:
+                lines.append(f"    Commands: {', '.join(cmds)}")
+        lines.append("")
+    if not found_any:
+        await update.message.reply_text("No clients have plugins installed.")
+        return
     await update.message.reply_text("\n".join(lines))
 
 
@@ -554,7 +682,17 @@ async def tg_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Admin only")
         return
-    await update.message.reply_text(f"Panel: {PUBLIC_URL}/admin?key={SECRET_KEY}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🖥 Open Admin Panel",
+            web_app=WebAppInfo(url=f"{PUBLIC_URL}/admin?key={SECRET_KEY}")
+        )
+    ]])
+    await update.message.reply_text(
+        "🔧 *Admin Panel*\nOpen the full web panel:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
 
 
 async def h_keepalive_ping(request: web.Request) -> web.Response:
@@ -613,6 +751,21 @@ async def h_bind(request: web.Request) -> web.Response:
         return web.json_response({"error": "Bad request — need user_id (int) and pc_name"}, status=400)
     ok, msg = do_bind(uid, pc_name)
     return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 400)
+
+
+async def h_plugins(request: web.Request) -> web.Response:
+    if not _check_admin(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    result = []
+    for name, session in active_sessions.items():
+        plugins = session.get("plugins", [])
+        if plugins:
+            result.append({
+                "pc_name": name,
+                "connected": registry.is_alive(registry.clients.get(name)),
+                "plugins": plugins,
+            })
+    return web.json_response({"clients_with_plugins": result})
 
 
 async def h_unbind(request: web.Request) -> web.Response:
@@ -772,6 +925,11 @@ setInterval(refresh, 4000);
 
 
 async def h_admin(request: web.Request) -> web.Response:
+    # Сначала ищем admin_panel.html рядом с server_final.py (для Render — залейте туда)
+    html_file = Path(__file__).parent / "admin_panel.html"
+    if html_file.exists():
+        return web.Response(text=html_file.read_text(encoding="utf-8"), content_type="text/html")
+    # Запасной вариант — встроенный HTML
     return web.Response(text=ADMIN_HTML, content_type="text/html")
 
 
@@ -783,13 +941,19 @@ async def main() -> None:
     global tg_app
     if BOT_TOKEN:
         tg_app = Application.builder().token(BOT_TOKEN).build()
-        for cmd, handler in [
-            ("start", tg_start_v2), ("send", tg_send), ("broadcast", tg_broadcast),
-            ("scripts", tg_scripts), ("online", tg_online), ("offline", tg_offline),
-            ("sessions", tg_sessions), ("users", tg_users), ("bind", tg_bind),
-            ("unbind", tg_unbind), ("panel", tg_panel),
-        ]:
-            tg_app.add_handler(CommandHandler(cmd, handler))
+        tg_app.add_handler(CommandHandler("start", tg_start_v2))
+        tg_app.add_handler(CommandHandler("send", tg_send))
+        tg_app.add_handler(CommandHandler("broadcast", tg_broadcast))
+        tg_app.add_handler(CommandHandler("scripts", tg_scripts))
+        tg_app.add_handler(CommandHandler("online", tg_online))
+        tg_app.add_handler(CommandHandler("offline", tg_offline))
+        tg_app.add_handler(CommandHandler("sessions", tg_sessions))
+        tg_app.add_handler(CommandHandler("users", tg_users))
+        tg_app.add_handler(CommandHandler("bind", tg_bind))
+        tg_app.add_handler(CommandHandler("unbind", tg_unbind))
+        tg_app.add_handler(CommandHandler("panel", tg_panel))
+        tg_app.add_handler(CommandHandler("plugins", tg_plugins))
+        tg_app.add_handler(CallbackQueryHandler(tg_callback))
         tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_text))
         await tg_app.initialize()
         await tg_app.start()
@@ -811,6 +975,7 @@ async def main() -> None:
     app.router.add_post("/api/broadcast", h_broadcast)
     app.router.add_get("/version", h_version)
     app.router.add_get("/update", h_update)
+    app.router.add_get("/api/plugins", h_plugins)
 
     runner = web.AppRunner(app)
     await runner.setup()
